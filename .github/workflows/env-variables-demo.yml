@@ -1,0 +1,179 @@
+# GitHub Actions Environment Variables Demo
+# This workflow demonstrates different ways to use environment variables
+
+name: Environment Variables Demo
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # Allows manual triggering
+
+# ============================================
+# 1. WORKFLOW-LEVEL ENVIRONMENT VARIABLES
+# ============================================
+# These are available to ALL jobs and steps in the workflow
+env:
+  WORKFLOW_VAR: "I am available everywhere in this workflow"
+  APP_NAME: "MyApp"
+  VERSION: "1.0.0"
+
+jobs:
+  demo-env-variables:
+    runs-on: ubuntu-latest
+    
+    # ============================================
+    # 2. JOB-LEVEL ENVIRONMENT VARIABLES
+    # ============================================
+    # These are available to all steps within THIS job only
+    env:
+      JOB_VAR: "I am available to all steps in this job"
+      ENVIRONMENT: "development"
+    
+    steps:
+      # ============================================
+      # 3. STEP-LEVEL ENVIRONMENT VARIABLES
+      # ============================================
+      - name: Step with its own env vars
+        env:
+          STEP_VAR: "I am only available in this step"
+          GREETING: "Hello"
+        run: |
+          echo "Step var: $STEP_VAR"
+          echo "Job var: $JOB_VAR"
+          echo "Workflow var: $WORKFLOW_VAR"
+          
+      # ============================================
+      # 4. DEFAULT ENVIRONMENT VARIABLES
+      # ============================================
+      # GitHub provides many built-in variables automatically
+      - name: Using default GitHub variables
+        run: |
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Branch/Ref: $GITHUB_REF"
+          echo "SHA: $GITHUB_SHA"
+          echo "Actor (who triggered): $GITHUB_ACTOR"
+          echo "Workflow name: $GITHUB_WORKFLOW"
+          echo "Run ID: $GITHUB_RUN_ID"
+          echo "Run Number: $GITHUB_RUN_NUMBER"
+          echo "Workspace: $GITHUB_WORKSPACE"
+          echo "Event name: $GITHUB_EVENT_NAME"
+          
+      # ============================================
+      # 5. USING SECRETS AS ENVIRONMENT VARIABLES
+      # ============================================
+      # Secrets are stored in repository settings and accessed via secrets context
+      - name: Using secrets (example)
+        env:
+          MY_SECRET: ${{ secrets.MY_SECRET_NAME }}
+          API_KEY: ${{ secrets.API_KEY }}
+        run: |
+          # Secrets are masked in logs automatically
+          echo "Secret is set: $MY_SECRET"
+          # Never echo actual secret values!
+          
+      # ============================================
+      # 6. SETTING DYNAMIC ENVIRONMENT VARIABLES
+      # ============================================
+      # Set env vars dynamically for subsequent steps
+      - name: Set dynamic env var
+        run: |
+          echo "DYNAMIC_VAR=This was set dynamically" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+          echo "RANDOM_ID=$RANDOM" >> $GITHUB_ENV
+          
+      - name: Use dynamic env var
+        run: |
+          echo "Dynamic var: $DYNAMIC_VAR"
+          echo "Build date: $BUILD_DATE"
+          echo "Random ID: $RANDOM_ID"
+          
+      # ============================================
+      # 7. USING CONTEXTS FOR ENV-LIKE VALUES
+      # ============================================
+      - name: Using GitHub contexts
+        run: |
+          echo "GitHub context - actor: ${{ github.actor }}"
+          echo "GitHub context - repo: ${{ github.repository }}"
+          echo "Runner context - os: ${{ runner.os }}"
+          echo "Job context - status: ${{ job.status }}"
+          
+      # ============================================
+      # 8. CONDITIONAL ENV VARIABLES
+      # ============================================
+      - name: Environment based on condition
+        env:
+          ENV_TYPE: ${{ github.ref == 'refs/heads/main' && 'production' || 'development' }}
+        run: |
+          echo "Environment type: $ENV_TYPE"
+          
+      # ============================================
+      # 9. MULTI-LINE ENVIRONMENT VARIABLES
+      # ============================================
+      - name: Set multi-line env var
+        run: |
+          echo "MULTI_LINE<<EOF" >> $GITHUB_ENV
+          echo "Line 1 of content" >> $GITHUB_ENV
+          echo "Line 2 of content" >> $GITHUB_ENV
+          echo "Line 3 of content" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          
+      - name: Use multi-line env var
+        run: |
+          echo "Multi-line content:"
+          echo "$MULTI_LINE"
+
+  # ============================================
+  # 10. PASSING ENV VARS BETWEEN JOBS
+  # ============================================
+  producer-job:
+    runs-on: ubuntu-latest
+    # Define outputs that can be used by other jobs
+    outputs:
+      build_number: ${{ steps.set-output.outputs.build_num }}
+      timestamp: ${{ steps.set-output.outputs.time }}
+    steps:
+      - name: Set output values
+        id: set-output
+        run: |
+          echo "build_num=42" >> $GITHUB_OUTPUT
+          echo "time=$(date +'%H:%M:%S')" >> $GITHUB_OUTPUT
+          
+  consumer-job:
+    runs-on: ubuntu-latest
+    needs: producer-job
+    env:
+      # Use outputs from previous job as env vars
+      BUILD_NUMBER: ${{ needs.producer-job.outputs.build_number }}
+      BUILD_TIME: ${{ needs.producer-job.outputs.timestamp }}
+    steps:
+      - name: Use values from previous job
+        run: |
+          echo "Build number from producer: $BUILD_NUMBER"
+          echo "Build time from producer: $BUILD_TIME"
+
+# ============================================
+# SUMMARY OF ENV VAR METHODS:
+# ============================================
+#
+# | Method                    | Scope                  | Syntax                                    |
+# |---------------------------|------------------------|-------------------------------------------|
+# | Workflow-level env        | All jobs & steps       | env: at workflow root                     |
+# | Job-level env             | All steps in job       | env: under jobs.<job_id>                  |
+# | Step-level env            | Single step only       | env: under steps                          |
+# | Default GitHub vars       | Everywhere             | $GITHUB_* (e.g., $GITHUB_REPOSITORY)      |
+# | Secrets                   | Via secrets context    | ${{ secrets.SECRET_NAME }}                |
+# | Dynamic (GITHUB_ENV)      | Subsequent steps       | echo "VAR=value" >> $GITHUB_ENV           |
+# | Job outputs               | Dependent jobs         | needs.<job>.outputs.<name>                |
+# | Contexts                  | Expressions            | ${{ github.*, runner.*, env.*, etc. }}    |
+#
+# ============================================
+# BEST PRACTICES:
+# ============================================
+# 1. Use secrets for sensitive data (API keys, passwords)
+# 2. Use workflow-level env for shared configuration
+# 3. Use GITHUB_ENV for dynamic values needed across steps
+# 4. Use job outputs for passing data between jobs
+# 5. Prefix custom env vars to avoid conflicts (e.g., MY_APP_*)
+# 6. Never log or echo secret values
