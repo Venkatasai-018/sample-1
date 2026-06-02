@@ -1,0 +1,386 @@
+name: Build and Deploy to ECS
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - qa
+
+# Required permissions for OIDC authentication with AWS
+permissions:
+  id-token: write    # Required for OIDC
+  contents: read     # Required to checkout code
+
+# Only AWS region is workflow-wide; everything else comes from GitHub Environment vars
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  # ============================================
+  # BUILD JOB
+  # ============================================
+  build:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    # Bind to GitHub Environment (dev or qa) so vars.* auto-resolves
+    environment: ${{ github.event.inputs.environment }}
+    outputs:
+      image_tag: ${{ steps.generate-tag.outputs.tag }}
+      image_uri: ${{ steps.build-image.outputs.image_uri }}
+      environment: ${{ github.event.inputs.environment }}
+    
+    # All values pulled from GitHub Environment variables (vars.*)
+    env:
+      ROLE_ARN:           ${{ vars.AWS_ROLE_ARN }}
+      AWS_ACCOUNT_ID:     ${{ vars.AWS_ACCOUNT_ID }}
+      ECR_REGISTRY:       ${{ vars.ECR_REGISTRY }}
+      ECR_REPOSITORY:     ${{ vars.ECR_REPOSITORY }}
+      ENV_SUFFIX:         ${{ vars.ENV_SUFFIX }}
+      SOURCE_REPO:        ${{ vars.SOURCE_REPO }}
+      SOURCE_REPO_BRANCH: ${{ vars.SOURCE_REPO_BRANCH }}
+    
+    steps:
+      - name: Display loaded environment configuration
+        run: |
+          echo "=== Loaded from GitHub Environment: ${{ github.event.inputs.environment }} ==="
+          echo "ROLE_ARN:        $ROLE_ARN"
+          echo "AWS_ACCOUNT_ID:  $AWS_ACCOUNT_ID"
+          echo "ECR_REGISTRY:    $ECR_REGISTRY"
+          echo "ECR_REPOSITORY:  $ECR_REPOSITORY"
+          echo "ENV_SUFFIX:      $ENV_SUFFIX"
+          echo "SOURCE_REPO:     $SOURCE_REPO"
+
+      # --------------------------------------------
+      # Checkout backend repository
+      # --------------------------------------------
+      - name: Checkout source code from another repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REPO_BRANCH }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}  # PAT with repo access
+          path: source-code
+
+      # --------------------------------------------
+      # OIDC Authentication with AWS
+      # --------------------------------------------
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          role-session-name: GitHubActions-${{ env.ENV_SUFFIX }}-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity (OIDC check)
+        run: |
+          echo "Verifying AWS authentication..."
+          aws sts get-caller-identity
+          echo "OIDC authentication successful!"
+
+      # --------------------------------------------
+      # Login to Amazon ECR
+      # --------------------------------------------
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # --------------------------------------------
+      # Generate Image Tag
+      # --------------------------------------------
+      - name: Generate Docker image tag
+        id: generate-tag
+        run: |
+          # Tag format: <env>-<short-sha>-<timestamp>
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          TIMESTAMP=$(date +'%Y%m%d-%H%M%S')
+          TAG="${ENV_SUFFIX}-${SHORT_SHA}-${TIMESTAMP}"
+          
+          echo "Generated tag: $TAG"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=$TAG" >> $GITHUB_ENV
+
+      # --------------------------------------------
+      # Build Docker Image
+      # --------------------------------------------
+      - name: Build Docker image
+        id: build-image
+        working-directory: source-code
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          IMAGE_URI_LATEST="${ECR_REGISTRY}/${ECR_REPOSITORY}:${ENV_SUFFIX}-latest"
+          
+          echo "Building Docker image: $IMAGE_URI"
+          docker build \
+            --build-arg ENV=${ENV_SUFFIX} \
+            -t $IMAGE_URI \
+            -t $IMAGE_URI_LATEST \
+            .
+          
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+          echo "IMAGE_URI_LATEST=$IMAGE_URI_LATEST" >> $GITHUB_ENV
+
+      # --------------------------------------------
+      # Trivy Vulnerability Scanning
+      # --------------------------------------------
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_URI }}
+          format: 'table'
+          exit-code: '1'              # Fail build if vulnerabilities found
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'   # Fail only on CRITICAL/HIGH
+
+      - name: Download Trivy HTML template
+        if: always()
+        run: |
+          mkdir -p .trivy
+          curl -sSL -o .trivy/html.tpl \
+            https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl
+
+      - name: Generate Trivy HTML report
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_URI }}
+          format: 'template'
+          template: '@.trivy/html.tpl'
+          output: 'trivy-report.html'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Generate Trivy JSON report (optional)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_URI }}
+          format: 'json'
+          output: 'trivy-report.json'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Upload Trivy HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-html-report-${{ env.IMAGE_TAG }}
+          path: |
+            trivy-report.html
+            trivy-report.json
+          retention-days: 30
+
+      # --------------------------------------------
+      # Push image to ECR
+      # --------------------------------------------
+      - name: Push Docker image to ECR
+        run: |
+          echo "Pushing image to ECR: $IMAGE_URI"
+          docker push $IMAGE_URI
+          docker push $IMAGE_URI_LATEST
+          echo "Image pushed successfully!"
+          echo "Tag: $IMAGE_TAG"
+
+  # ============================================
+  # DEPLOY JOB
+  # ============================================
+  deploy:
+    name: Deploy to ECS
+    needs: build
+    runs-on: ubuntu-latest
+    # Binds to dev/qa environment — triggers approval rules if configured
+    environment: ${{ needs.build.outputs.environment }}
+    
+    # All values pulled from the bound GitHub Environment's variables
+    env:
+      ROLE_ARN:            ${{ vars.AWS_ROLE_ARN }}
+      ENV_SUFFIX:          ${{ vars.ENV_SUFFIX }}
+      ECS_CLUSTER:         ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE:         ${{ vars.ECS_SERVICE }}
+      ECS_TASK_DEFINITION: ${{ vars.ECS_TASK_DEFINITION }}
+      CONTAINER_NAME:      ${{ vars.CONTAINER_NAME }}
+      IMAGE_URI:           ${{ needs.build.outputs.image_uri }}
+      IMAGE_TAG:           ${{ needs.build.outputs.image_tag }}
+    
+    steps:
+      - name: Display deploy configuration
+        run: |
+          echo "=== Deploying to environment: ${{ needs.build.outputs.environment }} ==="
+          echo "ECS_CLUSTER:     $ECS_CLUSTER"
+          echo "ECS_SERVICE:     $ECS_SERVICE"
+          echo "TASK_DEFINITION: $ECS_TASK_DEFINITION"
+          echo "IMAGE_URI:       $IMAGE_URI"
+
+      # --------------------------------------------
+      # OIDC Authentication with AWS
+      # --------------------------------------------
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          role-session-name: GitHubActions-Deploy-${{ env.ENV_SUFFIX }}-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # --------------------------------------------
+      # Pull image from ECR (verify)
+      # --------------------------------------------
+      - name: Login to ECR for pull
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Pull Docker image from ECR
+        run: |
+          echo "Pulling image to verify availability..."
+          docker pull $IMAGE_URI
+          echo "Image pulled successfully: $IMAGE_URI"
+
+      # --------------------------------------------
+      # Update ECS Task Definition
+      # --------------------------------------------
+      - name: Download current task definition
+        run: |
+          echo "Downloading task definition: $ECS_TASK_DEFINITION"
+          aws ecs describe-task-definition \
+            --task-definition $ECS_TASK_DEFINITION \
+            --query taskDefinition > task-definition.json
+
+      - name: Update task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ env.IMAGE_URI }}
+
+      # --------------------------------------------
+      # Deploy & force new deployment
+      # --------------------------------------------
+      - name: Deploy updated task to ECS (force new deployment)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          force-new-deployment: true       # Spin up new task forcefully
+          wait-for-service-stability: true # Wait for deployment to stabilize
+          wait-for-minutes: 10
+
+      # --------------------------------------------
+      # Health Check
+      # --------------------------------------------
+      - name: Container health check
+        run: |
+          echo "=== Checking ECS Service Health ==="
+          echo "Cluster: $ECS_CLUSTER"
+          echo "Service: $ECS_SERVICE"
+          
+          # Get service details
+          SERVICE_INFO=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE)
+          
+          RUNNING=$(echo "$SERVICE_INFO" | jq -r '.services[0].runningCount')
+          DESIRED=$(echo "$SERVICE_INFO" | jq -r '.services[0].desiredCount')
+          PENDING=$(echo "$SERVICE_INFO" | jq -r '.services[0].pendingCount')
+          
+          echo "Running tasks:  $RUNNING"
+          echo "Desired tasks:  $DESIRED"
+          echo "Pending tasks:  $PENDING"
+          
+          # Verify counts match
+          if [[ "$RUNNING" != "$DESIRED" ]]; then
+            echo "ERROR: Running count ($RUNNING) does not match desired count ($DESIRED)"
+            exit 1
+          fi
+          
+          # Check task health status
+          TASK_ARNS=$(aws ecs list-tasks \
+            --cluster $ECS_CLUSTER \
+            --service-name $ECS_SERVICE \
+            --query 'taskArns' --output text)
+          
+          for TASK_ARN in $TASK_ARNS; do
+            HEALTH=$(aws ecs describe-tasks \
+              --cluster $ECS_CLUSTER \
+              --tasks $TASK_ARN \
+              --query 'tasks[0].healthStatus' --output text)
+            
+            STATUS=$(aws ecs describe-tasks \
+              --cluster $ECS_CLUSTER \
+              --tasks $TASK_ARN \
+              --query 'tasks[0].lastStatus' --output text)
+            
+            echo "Task: $TASK_ARN"
+            echo "  Status: $STATUS"
+            echo "  Health: $HEALTH"
+            
+            if [[ "$STATUS" != "RUNNING" ]]; then
+              echo "ERROR: Task is not in RUNNING state"
+              exit 1
+            fi
+            
+            if [[ "$HEALTH" == "UNHEALTHY" ]]; then
+              echo "ERROR: Task is UNHEALTHY"
+              exit 1
+            fi
+          done
+          
+          echo "=== All containers are healthy! ==="
+
+      # --------------------------------------------
+      # Deployment summary
+      # --------------------------------------------
+      - name: Deployment summary
+        run: |
+          echo "=========================================="
+          echo "        DEPLOYMENT SUCCESSFUL             "
+          echo "=========================================="
+          echo "Environment:    ${{ needs.build.outputs.environment }}"
+          echo "Image:          $IMAGE_URI"
+          echo "Tag:            $IMAGE_TAG"
+          echo "Cluster:        $ECS_CLUSTER"
+          echo "Service:        $ECS_SERVICE"
+          echo "Triggered by:   ${{ github.actor }}"
+          echo "=========================================="
+
+# ============================================
+# PREREQUISITES:
+# ============================================
+#
+# 1. AWS OIDC Setup:
+#    - Create OIDC provider in AWS IAM:
+#      Provider URL: https://token.actions.githubusercontent.com
+#      Audience: sts.amazonaws.com
+#    - Create IAM roles (dev & qa) with trust policy allowing GitHub OIDC
+#
+# 2. GitHub Secrets Required:
+#    - REPO_ACCESS_TOKEN: PAT for checking out another repo
+#
+# 3. GitHub Environments:
+#    - Create "dev" and "qa" environments in repo settings
+#    - Add protection rules for qa (e.g., required reviewers)
+#
+# 4. AWS Resources (per environment):
+#    - ECR repository: my-app-repo
+#    - ECS cluster: my-app-cluster-dev / my-app-cluster-qa
+#    - ECS service: my-app-service-dev / my-app-service-qa
+#    - ECS task definition: my-app-task-dev / my-app-task-qa
+#
+# 5. IAM Role Permissions:
+#    - ecr:GetAuthorizationToken
+#    - ecr:BatchCheckLayerAvailability
+#    - ecr:GetDownloadUrlForLayer
+#    - ecr:BatchGetImage
+#    - ecr:PutImage
+#    - ecs:DescribeServices
+#    - ecs:DescribeTaskDefinition
+#    - ecs:DescribeTasks
+#    - ecs:ListTasks
+#    - ecs:RegisterTaskDefinition
+#    - ecs:UpdateService
+#
+# ============================================
