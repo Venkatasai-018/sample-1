@@ -1,0 +1,331 @@
+================================================================================
+ BUILD AND DEPLOY TO ECS - WHAT EACH STEP DOES
+================================================================================
+
+Pipeline file: build-deploy-ecs.yml
+
+This pipeline takes source code from another GitHub repo, builds it into a
+Docker image, scans the image for security issues, pushes it to AWS ECR,
+and then updates an ECS service to run the new image with the right
+environment variables and secrets.
+
+You run it manually from the GitHub Actions tab and you pick "dev" or "qa".
+
+
+--------------------------------------------------------------------------------
+ HOW THE PIPELINE PICKS dev vs qa
+--------------------------------------------------------------------------------
+
+When you click "Run workflow" you pick dev or qa from a dropdown.
+
+The job then says:
+    environment: backend_${{ github.event.inputs.environment }}
+
+That tells GitHub: "use the variables and secrets stored in the GitHub
+Environment called backend_dev (or backend_qa)".
+
+So in the YAML you just write ${{ vars.ECS_CLUSTER }} and GitHub
+automatically fills in the dev cluster name or qa cluster name depending
+on what you picked. No if/else needed in the file.
+
+
+================================================================================
+ JOB 1 - BUILD
+================================================================================
+
+GOAL: produce a Docker image, scan it, push it to ECR.
+
+
+STEP 1: Display loaded environment configuration
+-------------------------------------------------
+Just prints values to the log (cluster name, repo name, etc).
+Helps you confirm "yes I really am deploying to dev, not prod".
+
+
+STEP 2: Checkout source code from another repo
+-----------------------------------------------
+The workflow file lives in one repo, but the actual app code lives in a
+different repo (Unsubscribe-ai/Backend).
+So we use actions/checkout with:
+  - repository: the app repo
+  - ref: which branch (main for dev, qa for qa)
+  - token: ORG_PAT (a Personal Access Token that can read that repo)
+The code gets downloaded into a folder called "source-code".
+
+
+STEP 3: Configure AWS credentials via OIDC
+-------------------------------------------
+Instead of storing AWS access keys in GitHub, GitHub gives AWS a signed
+token, and AWS lets us "become" an IAM role (github-actions-cicd).
+This is safer because there are no long-lived keys to leak.
+
+
+STEP 4: Verify AWS identity
+---------------------------
+Runs "aws sts get-caller-identity".
+Just prints "I am role X in account Y" so you can confirm we logged in.
+
+
+STEP 5: Login to Amazon ECR
+---------------------------
+Runs "docker login" against the ECR registry, using the temporary AWS
+credentials. Now Docker can push images to ECR.
+
+
+STEP 6: Generate Docker image tag
+---------------------------------
+Builds a unique tag like:  dev-a1b2c3d-20260604-130522
+                            |    |       |
+                            env  git sha timestamp
+This tag is unique forever, so you can always roll back to a specific build.
+We also tag the image as "dev-latest" as a moving pointer.
+
+
+STEP 7: Build Docker image
+--------------------------
+Runs "docker build" inside the source-code folder.
+Tags the result with both:
+  - the unique tag (dev-a1b2c3d-...)
+  - the latest tag (dev-latest)
+
+
+STEP 8: Run Trivy vulnerability scanner
+---------------------------------------
+Trivy looks inside the image for known security vulnerabilities (CVEs).
+- TRIVY_SEVERITY = which severities should FAIL the build (e.g. HIGH,CRITICAL)
+- ignore-unfixed: skip vulns that have no patch available yet
+If anything matches TRIVY_SEVERITY, the pipeline stops here. The bad
+image is NOT pushed.
+
+
+STEP 9: Generate Trivy HTML and JSON reports
+--------------------------------------------
+Even if the scan passed, we still want a readable report.
+- TRIVY_REPORT_SEVERITY is usually broader (e.g. HIGH,MEDIUM,LOW)
+  so the report shows everything, not just blockers.
+Produces trivy-report.html and trivy-report.json.
+
+
+STEP 10: Upload Trivy HTML report
+---------------------------------
+Attaches the HTML report to the workflow run so you can download it from
+the GitHub UI. Kept for 30 days.
+
+
+STEP 11: Push Docker image to ECR
+---------------------------------
+Pushes both tags (unique + latest) up to AWS ECR.
+
+
+STEP 12: Outputs
+----------------
+The build job tells the deploy job:
+  - image_tag    -> "dev-a1b2c3d-20260604-130522"
+  - image_uri    -> full path to the image in ECR
+  - environment  -> "backend_dev" or "backend_qa"
+
+
+================================================================================
+ JOB 2 - DEPLOY
+================================================================================
+
+GOAL: take that new image and make ECS run it, with the right env + secrets.
+
+
+STEP 1: Display deploy configuration
+------------------------------------
+Prints cluster/service/task-def names. Sanity check.
+
+
+STEP 2: Configure AWS credentials via OIDC
+------------------------------------------
+Same as build step 3. We log in fresh in this job because it's a new
+runner with no credentials.
+
+
+STEP 3: Login to ECR and pull the image
+---------------------------------------
+We actually pull the image we just pushed. Why?
+To prove it's really in ECR. If the push silently failed we want to
+catch it now, before touching ECS.
+
+
+STEP 4: Download current task definition
+----------------------------------------
+ECS uses a "task definition" - a JSON blueprint that says:
+  - which image to run
+  - what env vars
+  - what secrets
+  - what CPU/memory
+  - which roles to use
+We download whatever is currently active so we can modify it.
+Saves it as task-definition.json on disk.
+
+
+STEP 5: Inject env vars from GitHub secrets and variables
+---------------------------------------------------------
+We rewrite the "environment" section of the task definition.
+
+Three sources feed into it:
+
+  a) GitHub secrets (sensitive)
+     - DB_HOST, DB_PORT, DB_USERNAME, DB_NAME
+
+  b) GitHub variables (per-environment, not secret)
+     - NODE_ENV, LOG_LEVEL, PLAID_ENV
+     - PLAID_REDIRECT_URI, PLAID_WEBHOOK_URL
+     - CORS_ORIGIN, GOOGLE_REDIRECT_URI, GMAIL_REDIRECT_URI
+
+  c) Hardcoded constants (same everywhere)
+     - PORT=5000, PLAID_ENABLED=true
+     - CHECK_INTERVAL_*=25 (and similar feature flags)
+
+How: We build a list like KEY=VALUE lines, then jq turns it into the
+JSON array ECS wants:
+    [
+      { "name": "DB_HOST", "value": "..." },
+      { "name": "PORT",    "value": "5000" },
+      ...
+    ]
+Then jq patches that array into the right container in the task def file.
+
+
+STEP 6: Inject secrets from AWS Secrets Manager
+-----------------------------------------------
+The "secrets" section of a task def is different from "environment".
+"environment" stores values directly. "secrets" stores REFERENCES that
+ECS resolves at task start, like:
+    { "name": "JWT_SECRET",
+      "valueFrom": "arn:aws:secretsmanager:...:secret:backend/dev/app:JWT_SECRET::" }
+
+We pull from TWO secrets:
+
+  1) SECRETS_MANAGER_ARN (app-level: JWT, API keys, etc.)
+     Every key in this secret becomes an env var with the same name.
+
+  2) DB_SECRETS_MANAGER_ARN (RDS-managed DB secret)
+     RDS stores it as { "password": "...", "username": "..." } lowercase.
+     But our app expects DB_PASSWORD.
+     So we RENAME "password" -> "DB_PASSWORD".
+     And we FILTER OUT everything else (we only want the password from
+     this secret; the rest of the DB info comes from GitHub secrets).
+
+Then we MERGE both lists and write them into the task def's secrets array.
+
+
+STEP 7: Render new task definition with new image
+-------------------------------------------------
+The official Amazon action takes our patched task-definition.json and
+overrides ONLY the container's "image" field with the new ECR URI.
+Outputs the final JSON to a new path.
+
+
+STEP 8: Deploy to ECS
+---------------------
+The official Amazon deploy action does three things:
+  1. RegisterTaskDefinition - creates a new revision of the task def
+  2. UpdateService          - tells the service to use the new revision
+                              with force-new-deployment = true
+  3. Waits up to 10 minutes for the service to become "stable"
+     (= desired number of tasks running, no rollback in progress)
+
+force-new-deployment matters because even if the image tag is unchanged,
+we want fresh tasks (so they pick up rotated secrets, new env vars, etc).
+
+
+STEP 9: Container health check
+-------------------------------
+ECS "stable" is not always enough. We additionally check:
+  - runningCount == desiredCount
+  - every task is in RUNNING state
+  - no task is in UNHEALTHY state
+If anything fails, the workflow fails so you get notified.
+
+
+STEP 11: Deployment summary
+---------------------------
+Prints environment, image URI, tag, cluster, service, and who triggered
+the run. Easy audit trail in the workflow log.
+
+
+================================================================================
+ WHERE DOES EACH PIECE OF CONFIG LIVE?
+================================================================================
+
+| Type of value          | Stored in                       | Example          |
+|------------------------|----------------------------------|------------------|
+| URLs, modes, infra IDs | GitHub Environment "variables"   | NODE_ENV         |
+| DB connection info     | GitHub Environment "secrets"     | DB_HOST          |
+| App secrets/API keys   | AWS Secrets Manager (app secret) | JWT_SECRET       |
+| DB password            | AWS Secrets Manager (DB secret)  | password         |
+| Same-everywhere values | Hardcoded in the workflow YAML   | PORT=5000        |
+
+The reason DB password is in Secrets Manager (not GitHub) is:
+  - RDS can auto-rotate it
+  - ECS reads the fresh value at every task start
+  - You never have to update GitHub when rotation happens
+
+
+================================================================================
+ SECRET ROTATION - WHAT HAPPENS
+================================================================================
+
+1. AWS rotates the DB password in Secrets Manager (manual or automatic).
+2. You re-run this workflow.
+3. force-new-deployment starts brand new tasks.
+4. Those tasks read the CURRENT password from Secrets Manager at startup.
+5. Old tasks drain. New tasks running with new password. Done.
+No code change, no image rebuild.
+
+
+================================================================================
+ ROLLBACK - HOW TO GO BACK
+================================================================================
+
+Each build has a unique image tag like dev-a1b2c3d-20260604-130522 that
+never gets overwritten. So you can always roll back:
+
+  Option A (UI): re-run a previous successful workflow run.
+
+  Option B (CLI): tell ECS to use the old task def revision:
+    aws ecs update-service \
+      --cluster unsubscribe-dev-cluster \
+      --service unsubscribe-dev-service \
+      --task-definition unsubscribe-dev:42 \
+      --force-new-deployment
+
+================================================================================
+ ORDER OF EXECUTION SUMMARY
+================================================================================
+
+  pick env in UI
+        |
+        v
+  resolve backend_<env> environment
+        |
+        v
+  BUILD JOB
+   - checkout source repo
+   - aws login (OIDC)
+   - ecr login
+   - generate tag
+   - docker build
+   - trivy scan (can fail here)
+   - trivy reports + upload
+   - docker push
+        |
+        v
+  DEPLOY JOB
+   - aws login (OIDC)
+   - pull image (verify)
+   - download current task def
+   - inject env vars (GitHub secrets + vars + constants)
+   - inject secrets (app secret + DB secret with rename)
+   - verify everything is in place
+   - render new task def with new image
+   - register new revision + update service + wait stable
+   - health check (running/desired/healthy)
+   - print summary
+        |
+        v
+  DONE - new version running in ECS
