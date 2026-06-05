@@ -1,0 +1,258 @@
+================================================================================
+ BRANCHING STRATEGY & PR APPROVAL POLICY
+================================================================================
+
+This document defines:
+  - How we organize branches
+  - How Pull Requests are reviewed and approved
+  - Which branches are allowed to deploy to which environments
+
+
+================================================================================
+ 1. BRANCHES
+================================================================================
+
+| Branch       | Purpose                                | Deploys to   | Long-lived |
+|--------------|----------------------------------------|--------------|------------|
+| main         | Production-ready code                  | prod         | yes        |
+| develop      | Integration branch for in-progress work| dev, qa      | yes        |
+| feature/*    | New features                           | any non-prod | no         |
+| bugfix/*     | Non-urgent bug fixes                   | any non-prod | no         |
+| hotfix/*     | Urgent prod fixes (branched from main) | prod         | no         |
+| release/*    | Release stabilization (optional)       | qa -> prod   | no         |
+
+Naming convention:
+  feature/<ticket-id>-<short-description>
+  bugfix/<ticket-id>-<short-description>
+  hotfix/<ticket-id>-<short-description>
+  release/v<major>.<minor>.<patch>
+
+Examples:
+  feature/UNS-123-gmail-batch-unsubscribe
+  hotfix/UNS-456-token-refresh-crash
+  release/v1.4.0
+
+
+================================================================================
+ 2. FLOW (SIMPLE DIAGRAM)
+================================================================================
+
+  feature/UNS-123        develop              main
+       |                    |                  |
+       |  (commits)         |                  |
+       |------------------->|  PR: 1 approval  |
+       |                    |                  |
+       |                    |  (more features merged)
+       |                    |                  |
+       |                    |----------------->|  PR: 2 approvals
+       |                    |                  |
+       |                    |                  | -> deploys to PROD
+
+
+  HOTFIX FLOW:
+
+       main
+        |
+        |---- hotfix/UNS-456 ----> PR back to main (2 approvals) -> PROD
+        |                                |
+        |                                +----> PR back to develop (back-merge)
+
+
+================================================================================
+ 3. PR APPROVAL RULES
+================================================================================
+
+INTO develop:
+  - 1 reviewer approval required
+  - Reviewer must NOT be the PR author
+  - CI must be green (build + lint + test + SAST)
+  - All review comments resolved
+  - Branch up to date with develop
+
+INTO main:
+  - 2 reviewer approvals required
+  - At least 1 must be a CODEOWNER
+  - Reviewer must NOT be the PR author
+  - CI must be green (build + lint + test + SAST + SCA + container scan)
+  - All review comments resolved
+  - Branch up to date with main
+  - Stale approvals are dismissed when new commits are pushed
+
+
+================================================================================
+ 4. GITHUB BRANCH PROTECTION SETTINGS
+================================================================================
+
+Set under: Settings -> Branches -> Add rule
+
+------------------------------------------------------------
+ Rule for "develop"
+------------------------------------------------------------
+
+  Branch name pattern                          : develop
+  Require a pull request before merging        : ON
+  Required approvals                           : 1
+  Dismiss stale approvals on new commits       : ON
+  Require review from CODEOWNERS               : OFF (optional)
+  Require status checks                        : ON
+  Required status checks                       : build, lint, test, sast
+  Require branches to be up to date            : ON
+  Require conversation resolution              : ON
+  Require linear history                       : ON
+  Do not allow bypassing the above             : ON
+  Allow force pushes                           : OFF
+  Allow deletions                              : OFF
+
+
+------------------------------------------------------------
+ Rule for "main"
+------------------------------------------------------------
+
+  Branch name pattern                          : main
+  Require a pull request before merging        : ON
+  Required approvals                           : 2
+  Dismiss stale approvals on new commits       : ON
+  Require review from CODEOWNERS               : ON
+  Require status checks                        : ON
+  Required status checks                       : build, lint, test, sast,
+                                                 sca, container-scan
+  Require branches to be up to date            : ON
+  Require conversation resolution              : ON
+  Require signed commits                       : ON (recommended)
+  Require linear history                       : ON
+  Include administrators                       : ON
+  Do not allow bypassing the above             : ON
+  Restrict who can push                        : release managers only
+  Allow force pushes                           : OFF
+  Allow deletions                              : OFF
+
+
+================================================================================
+ 5. PIPELINE & DEPLOYMENT RULES
+================================================================================
+
+Pipelines can be RUN from any branch, but each pipeline restricts which
+environment it can DEPLOY to, based on the source branch.
+
+| Pipeline                | Run from           | Deploy to          |
+|-------------------------|--------------------|--------------------|
+| Backend ECS (dev/qa)    | any branch         | dev, qa            |
+| Frontend S3 (dev/qa)    | any branch         | dev, qa            |
+| Backend ECS  PROD       | main only          | prod               |
+| Frontend S3  PROD       | main only          | prod               |
+
+
+ENFORCEMENT (use BOTH layers):
+
+  Layer A - GitHub Environment protection (UI)
+    On each *_prod GitHub Environment:
+      - Required reviewers   : at least 1 release manager
+      - Deployment branches  : Selected branches -> main only
+      - Wait timer           : optional (e.g. 5 min)
+
+  Layer B - In-workflow guard (defense in depth)
+    Add this step at the top of every prod deploy job:
+
+      - name: Verify branch is main
+        if: github.event.inputs.environment == 'prod'
+        run: |
+          if [[ "${GITHUB_REF##*/}" != "main" ]]; then
+            echo "ERROR: prod deployments allowed only from 'main' branch."
+            echo "Current ref: $GITHUB_REF"
+            exit 1
+          fi
+
+
+================================================================================
+ 6. CODEOWNERS
+================================================================================
+
+Create the file .github/CODEOWNERS so reviewers are auto-requested and the
+"CODEOWNER approval" rule on main can be enforced.
+
+Example:
+
+  # Default owners for everything
+  *                           @your-org/tech-leads
+
+  # Backend
+  /.github/workflows/*ecs*    @your-org/devops
+  /backend/                   @your-org/backend-team
+
+  # Frontend
+  /.github/workflows/*s3*     @your-org/devops
+  /frontend/                  @your-org/frontend-team
+
+  # Infrastructure
+  /terraform/                 @your-org/devops
+  /.github/                   @your-org/devops
+
+
+================================================================================
+ 7. MERGE STRATEGY
+================================================================================
+
+| From                | To       | Merge type      | Why                       |
+|---------------------|----------|------------------|---------------------------|
+| feature/*           | develop  | Squash and merge | One commit per feature    |
+| develop             | main     | Merge commit     | Preserves feature history |
+| hotfix/*            | main     | Squash and merge | One commit per fix        |
+| main (back-merge)   | develop  | Merge commit     | Keeps hotfix commits      |
+
+Disable the unwanted merge methods in:
+  Settings -> General -> Pull Requests
+
+
+
+
+================================================================================
+ 9. RELEASE TAGGING
+================================================================================
+
+When develop -> main is merged:
+
+  1. Tag main with semver:
+        git tag -a v1.4.0 -m "Release v1.4.0"
+        git push origin v1.4.0
+
+  2. Create a GitHub Release from the tag with auto-generated notes.
+
+  3. Prod deploy pipeline can be triggered from the tag (immutable reference).
+
+Versioning:
+  MAJOR  -> breaking change
+  MINOR  -> new feature, backwards compatible
+  PATCH  -> bug fix, backwards compatible
+
+
+================================================================================
+ 10. SUMMARY TABLE
+================================================================================
+
+| Concern                          | develop              | main                  |
+|----------------------------------|----------------------|-----------------------|
+| Required PR approvals            | 1                    | 2                     |
+| CODEOWNER approval required      | optional             | yes                   |
+| Stale approvals dismissed        | yes                  | yes                   |
+| Required CI checks               | build, lint, test,   | build, lint, test,    |
+|                                  | sast                 | sast, sca, container  |
+| Force push allowed               | no                   | no                    |
+| Branch deletion allowed          | no                   | no                    |
+| Linear history required          | yes                  | yes                   |
+| Can deploy to dev / qa           | yes                  | yes                   |
+| Can deploy to prod               | NO                   | YES (only main)       |
+| Merge strategy                   | squash               | merge commit          |
+
+
+================================================================================
+ 11. SETUP CHECKLIST
+================================================================================
+
+  [ ] Confirm main and develop branches exist
+  [ ] Add branch protection rule for develop (section 4)
+  [ ] Add branch protection rule for main (section 4)
+  [ ] Create .github/CODEOWNERS file (section 6)
+  [ ] Configure *_prod GitHub Environments with main-only deployment branches
+  [ ] Add "Verify branch is main" step to prod deploy jobs (section 5)
+  [ ] Disable unused merge methods in repo settings (section 7)
+  [ ] Communicate the policy to the team
