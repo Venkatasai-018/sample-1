@@ -1,0 +1,267 @@
+# Build and Deploy to EC2 (Single instance for dev/qa, ASG for prod)
+# Build once on GitHub runner → Upload to S3 → SSH to EC2(s) → Idempotent setup + reload
+
+name: Build and Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - qa
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  NODE_VERSION: '20'
+
+jobs:
+  # ============================================
+  # BUILD JOB — runs on GitHub runner
+  # ============================================
+  build:
+    name: Build artifact
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    outputs:
+      artifact_name: ${{ steps.pack.outputs.artifact_name }}
+      s3_key:        ${{ steps.upload.outputs.s3_key }}
+      build_id:      ${{ steps.pack.outputs.build_id }}
+    env:
+      ROLE_ARN:        ${{ vars.AWS_ROLE_ARN }}
+      ENVIRONMENT:     ${{ vars.ENV_SUFFIX }}
+      ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+      PROJECT:         ${{ vars.PROJECT }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build app
+        run: npm run build
+
+      # Package: dist + package files + scripts (setup.sh + ecosystem)
+      - name: Package artifact
+        id: pack
+        run: |
+          BUILD_ID="${ENVIRONMENT}-$(echo ${{ github.sha }} | cut -c1-7)-$(date +%Y%m%d-%H%M%S)"
+          ARTIFACT_NAME="${PROJECT}-${BUILD_ID}.tar.gz"
+          
+          mkdir -p staging
+          cp -r dist staging/
+          cp package.json package-lock.json staging/
+          cp -r scripts staging/   # setup.sh + ecosystem.config.js live here
+          
+          tar -czf "$ARTIFACT_NAME" -C staging .
+          ls -lh "$ARTIFACT_NAME"
+          
+          echo "build_id=$BUILD_ID" >> $GITHUB_OUTPUT
+          echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          role-session-name: GitHub-Build-${{ env.ENVIRONMENT }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload artifact to S3
+        id: upload
+        run: |
+          S3_KEY="${PROJECT}/${ENVIRONMENT}/${{ steps.pack.outputs.artifact_name }}"
+          aws s3 cp "${{ steps.pack.outputs.artifact_name }}" "s3://${ARTIFACT_BUCKET}/${S3_KEY}"
+          
+          # Also update 'latest' pointer for ASG scale-out auto-deploy
+          aws s3 cp "${{ steps.pack.outputs.artifact_name }}" \
+            "s3://${ARTIFACT_BUCKET}/${PROJECT}/${ENVIRONMENT}/latest.tar.gz"
+          
+          echo "s3_key=$S3_KEY" >> $GITHUB_OUTPUT
+          echo "Uploaded to s3://${ARTIFACT_BUCKET}/${S3_KEY}"
+
+  # ============================================
+  # DEPLOY JOB — SSH to EC2(s) and run setup.sh
+  # ============================================
+  deploy:
+    name: Deploy to ${{ github.event.inputs.environment }}
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      ROLE_ARN:        ${{ vars.AWS_ROLE_ARN }}
+      ENVIRONMENT:     ${{ vars.ENV_SUFFIX }}
+      PROJECT:         ${{ vars.PROJECT }}
+      ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+      S3_KEY:          ${{ needs.build.outputs.s3_key }}
+      BUILD_ID:        ${{ needs.build.outputs.build_id }}
+      
+      # Single EC2 (dev/qa)
+      EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+      # ASG (prod)
+      ASG_NAME:        ${{ vars.ASG_NAME }}
+      USE_ASG:         ${{ vars.USE_ASG }}
+      
+      # App config
+      APP_PORT:        ${{ vars.APP_PORT }}
+      HEALTH_PATH:     ${{ vars.HEALTH_PATH }}
+      DOMAIN:          ${{ vars.DOMAIN }}
+      ENV_SECRET_ARN:  ${{ vars.ENV_SECRET_ARN }}
+      
+      SSH_USER:        ec2-user
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          role-session-name: GitHub-Deploy-${{ env.ENVIRONMENT }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ------------------------------------------------
+      # 1. Resolve target instance IPs (single or ASG)
+      # ------------------------------------------------
+      - name: Get target instance IPs
+        id: targets
+        run: |
+          if [[ "$USE_ASG" == "true" ]]; then
+            echo "PROD: fetching ASG instances from $ASG_NAME"
+            INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "$ASG_NAME" \
+              --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+              --output text)
+          else
+            echo "DEV/QA: using single instance $EC2_INSTANCE_ID"
+            INSTANCE_IDS="$EC2_INSTANCE_ID"
+          fi
+          
+          # Use PRIVATE IPs (assumes runner has VPC access via VPN/peering)
+          # If using PUBLIC IPs, change to PublicIpAddress
+          IPS=$(aws ec2 describe-instances \
+            --instance-ids $INSTANCE_IDS \
+            --query 'Reservations[].Instances[].PrivateIpAddress' \
+            --output text | tr '\t' ' ')
+          
+          echo "Target IPs: $IPS"
+          echo "ips=$IPS" >> $GITHUB_OUTPUT
+
+      # ------------------------------------------------
+      # 2. Setup SSH key
+      # ------------------------------------------------
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          cat >> ~/.ssh/config <<EOF
+          Host *
+            User $SSH_USER
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking no
+            UserKnownHostsFile=/dev/null
+            ServerAliveInterval 30
+          EOF
+
+      # ------------------------------------------------
+      # 3. Deploy to each instance (rolling for ASG)
+      # ------------------------------------------------
+      - name: Deploy to instances
+        run: |
+          IPS=(${{ steps.targets.outputs.ips }})
+          TOTAL=${#IPS[@]}
+          echo "Deploying $BUILD_ID to $TOTAL instance(s)"
+          
+          for i in "${!IPS[@]}"; do
+            IP="${IPS[$i]}"
+            echo ""
+            echo "=========================================="
+            echo "  [$((i+1))/$TOTAL] Deploying to $IP"
+            echo "=========================================="
+            
+            # Run remote setup script (idempotent: installs if missing, updates if present)
+            ssh $SSH_USER@$IP "bash -s" <<REMOTE
+              set -euo pipefail
+              
+              export BUILD_ID="$BUILD_ID"
+              export S3_KEY="$S3_KEY"
+              export ARTIFACT_BUCKET="$ARTIFACT_BUCKET"
+              export ENVIRONMENT="$ENVIRONMENT"
+              export APP_PORT="$APP_PORT"
+              export HEALTH_PATH="$HEALTH_PATH"
+              export DOMAIN="$DOMAIN"
+              export ENV_SECRET_ARN="$ENV_SECRET_ARN"
+              export AWS_REGION="$AWS_REGION"
+              
+              # Download artifact from S3
+              sudo mkdir -p /opt/deploy
+              sudo aws s3 cp "s3://\$ARTIFACT_BUCKET/\$S3_KEY" /opt/deploy/artifact.tar.gz
+              
+              # Run idempotent setup script (lives in artifact)
+              sudo mkdir -p /opt/deploy/release
+              sudo tar -xzf /opt/deploy/artifact.tar.gz -C /opt/deploy/release
+              sudo bash /opt/deploy/release/scripts/setup.sh
+          REMOTE
+            
+            if [[ $? -ne 0 ]]; then
+              echo "ERROR: Deploy failed on $IP"
+              exit 1
+            fi
+            
+            # Per-instance health check before moving to next (rolling)
+            echo "Health check on $IP..."
+            for attempt in {1..12}; do
+              CODE=\$(ssh $SSH_USER@$IP "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$APP_PORT$HEALTH_PATH" || echo "000")
+              echo "  attempt $attempt: HTTP $CODE"
+              if [[ "$CODE" == "200" ]]; then
+                echo "  $IP healthy"
+                break
+              fi
+              [[ $attempt -eq 12 ]] && { echo "ERROR: $IP failed health check"; exit 1; }
+              sleep 5
+            done
+          done
+
+      # ------------------------------------------------
+      # 4. Public endpoint health check
+      # ------------------------------------------------
+      - name: Public endpoint check
+        if: env.DOMAIN != ''
+        run: |
+          URL="https://${DOMAIN}${HEALTH_PATH}"
+          echo "Hitting public URL: $URL"
+          for i in {1..10}; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
+            echo "Attempt $i: HTTP $CODE"
+            [[ "$CODE" == "200" ]] && exit 0
+            sleep 5
+          done
+          echo "ERROR: Public health check failed"
+          exit 1
+
+      - name: Summary
+        run: |
+          echo "=========================================="
+          echo "       DEPLOYMENT SUCCESSFUL              "
+          echo "=========================================="
+          echo "Environment:  $ENVIRONMENT"
+          echo "Build ID:     $BUILD_ID"
+          echo "S3 Artifact:  s3://$ARTIFACT_BUCKET/$S3_KEY"
+          echo "Target mode:  $([ "$USE_ASG" == "true" ] && echo "ASG rolling" || echo "Single EC2")"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "=========================================="

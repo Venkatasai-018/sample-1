@@ -12,30 +12,27 @@ on:
           - dev
           - qa
 
-# Required permissions for OIDC authentication with AWS
 permissions:
-  id-token: write    # Required for OIDC
-  contents: read     # Required to checkout code
+  id-token: write    
+  contents: read     
 
-# Only AWS region is workflow-wide; everything else comes from GitHub Environment vars
 env:
   AWS_REGION: us-east-1
 
 jobs:
-  # ============================================
   # BUILD JOB
-  # ============================================
   build:
     name: Build and Push to ECR
     runs-on: ubuntu-latest
-    # Bind to GitHub Environment (dev or qa) so vars.* auto-resolves
-    environment: ${{ github.event.inputs.environment }}
+
+    environment: backend_${{ github.event.inputs.environment }}
     outputs:
       image_tag: ${{ steps.generate-tag.outputs.tag }}
       image_uri: ${{ steps.build-image.outputs.image_uri }}
-      environment: ${{ github.event.inputs.environment }}
+      environment: backend_${{ github.event.inputs.environment }}
     
-    # All values pulled from GitHub Environment variables (vars.*)
+    # variables
+
     env:
       ROLE_ARN:           ${{ vars.AWS_ROLE_ARN }}
       AWS_ACCOUNT_ID:     ${{ vars.AWS_ACCOUNT_ID }}
@@ -44,6 +41,9 @@ jobs:
       ENV_SUFFIX:         ${{ vars.ENV_SUFFIX }}
       SOURCE_REPO:        ${{ vars.SOURCE_REPO }}
       SOURCE_REPO_BRANCH: ${{ vars.SOURCE_REPO_BRANCH }}
+      NODE_VERSION:       ${{ vars.NODE_VERSION }}
+      TRIVY_SEVERITY:     ${{ vars.TRIVY_SEVERITY }}        # e.g. "HIGH" or "HIGH,MEDIUM"
+      TRIVY_REPORT_SEVERITY: ${{ vars.TRIVY_REPORT_SEVERITY }}  # e.g. "HIGH,MEDIUM,LOW"
     
     steps:
       - name: Display loaded environment configuration
@@ -56,25 +56,38 @@ jobs:
           echo "ENV_SUFFIX:      $ENV_SUFFIX"
           echo "SOURCE_REPO:     $SOURCE_REPO"
 
-      # --------------------------------------------
       # Checkout backend repository
-      # --------------------------------------------
+
       - name: Checkout source code from another repo
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.SOURCE_REPO_BRANCH }}
-          token: ${{ secrets.REPO_ACCESS_TOKEN }}  # PAT with repo access
+          token: ${{ secrets.ORG_PAT }}
           path: source-code
 
-      # --------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Lint source code
+        if: hashFiles('source-code/package.json') != ''
+        working-directory: source-code
+        run: |
+          npm ci
+          if npm run | grep -qE '^\s+lint$'; then
+            npm run lint
+          else
+            echo "No 'lint' script defined in package.json — skipping."
+          fi
+
+      
       # OIDC Authentication with AWS
-      # --------------------------------------------
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.ROLE_ARN }}
-          role-session-name: GitHubActions-${{ env.ENV_SUFFIX }}-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Verify AWS identity (OIDC check)
@@ -83,16 +96,12 @@ jobs:
           aws sts get-caller-identity
           echo "OIDC authentication successful!"
 
-      # --------------------------------------------
       # Login to Amazon ECR
-      # --------------------------------------------
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # --------------------------------------------
       # Generate Image Tag
-      # --------------------------------------------
       - name: Generate Docker image tag
         id: generate-tag
         run: |
@@ -105,9 +114,7 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "IMAGE_TAG=$TAG" >> $GITHUB_ENV
 
-      # --------------------------------------------
       # Build Docker Image
-      # --------------------------------------------
       - name: Build Docker image
         id: build-image
         working-directory: source-code
@@ -126,18 +133,16 @@ jobs:
           echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
           echo "IMAGE_URI_LATEST=$IMAGE_URI_LATEST" >> $GITHUB_ENV
 
-      # --------------------------------------------
       # Trivy Vulnerability Scanning
-      # --------------------------------------------
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ env.IMAGE_URI }}
           format: 'table'
-          exit-code: '1'              # Fail build if vulnerabilities found
+          exit-code: '1'             
           ignore-unfixed: true
           vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH'   # Fail only on CRITICAL/HIGH
+          severity: ${{ env.TRIVY_SEVERITY }}
 
       - name: Download Trivy HTML template
         if: always()
@@ -154,7 +159,7 @@ jobs:
           format: 'template'
           template: '@.trivy/html.tpl'
           output: 'trivy-report.html'
-          severity: 'CRITICAL,HIGH,MEDIUM'
+          severity: ${{ env.TRIVY_REPORT_SEVERITY }}
 
       - name: Generate Trivy JSON report (optional)
         if: always()
@@ -163,7 +168,7 @@ jobs:
           image-ref: ${{ env.IMAGE_URI }}
           format: 'json'
           output: 'trivy-report.json'
-          severity: 'CRITICAL,HIGH,MEDIUM'
+          severity: ${{ env.TRIVY_REPORT_SEVERITY }}
 
       - name: Upload Trivy HTML report
         if: always()
@@ -175,9 +180,7 @@ jobs:
             trivy-report.json
           retention-days: 30
 
-      # --------------------------------------------
       # Push image to ECR
-      # --------------------------------------------
       - name: Push Docker image to ECR
         run: |
           echo "Pushing image to ECR: $IMAGE_URI"
@@ -186,25 +189,24 @@ jobs:
           echo "Image pushed successfully!"
           echo "Tag: $IMAGE_TAG"
 
-  # ============================================
   # DEPLOY JOB
-  # ============================================
+  
   deploy:
     name: Deploy to ECS
     needs: build
     runs-on: ubuntu-latest
-    # Binds to dev/qa environment — triggers approval rules if configured
     environment: ${{ needs.build.outputs.environment }}
     
-    # All values pulled from the bound GitHub Environment's variables
     env:
       ROLE_ARN:            ${{ vars.AWS_ROLE_ARN }}
       ENV_SUFFIX:          ${{ vars.ENV_SUFFIX }}
       ECS_CLUSTER:         ${{ vars.ECS_CLUSTER }}
       ECS_SERVICE:         ${{ vars.ECS_SERVICE }}
       ECS_TASK_DEFINITION: ${{ vars.ECS_TASK_DEFINITION }}
-      CONTAINER_NAME:      ${{ vars.CONTAINER_NAME }}
-      IMAGE_URI:           ${{ needs.build.outputs.image_uri }}
+      CONTAINER_NAME:        ${{ vars.CONTAINER_NAME }}
+      SECRETS_MANAGER_ARN:   ${{ vars.SECRETS_MANAGER_ARN }}     # App-level secrets (JWT_SECRET, API keys, etc.)
+      DB_SECRETS_MANAGER_ARN: ${{ vars.DB_SECRETS_MANAGER_ARN }}  # DB credentials secret (e.g. RDS-managed)
+      IMAGE_URI:             ${{ needs.build.outputs.image_uri }}
       IMAGE_TAG:           ${{ needs.build.outputs.image_tag }}
     
     steps:
@@ -216,19 +218,14 @@ jobs:
           echo "TASK_DEFINITION: $ECS_TASK_DEFINITION"
           echo "IMAGE_URI:       $IMAGE_URI"
 
-      # --------------------------------------------
       # OIDC Authentication with AWS
-      # --------------------------------------------
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.ROLE_ARN }}
-          role-session-name: GitHubActions-Deploy-${{ env.ENV_SUFFIX }}-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # --------------------------------------------
-      # Pull image from ECR (verify)
-      # --------------------------------------------
+      # Pull image from ECR
       - name: Login to ECR for pull
         uses: aws-actions/amazon-ecr-login@v2
 
@@ -238,15 +235,171 @@ jobs:
           docker pull $IMAGE_URI
           echo "Image pulled successfully: $IMAGE_URI"
 
-      # --------------------------------------------
       # Update ECS Task Definition
-      # --------------------------------------------
       - name: Download current task definition
         run: |
           echo "Downloading task definition: $ECS_TASK_DEFINITION"
           aws ecs describe-task-definition \
             --task-definition $ECS_TASK_DEFINITION \
             --query taskDefinition > task-definition.json
+
+      # ----------------------------------------------------------------
+      # Inject env vars from GitHub Environment secrets
+      # ----------------------------------------------------------------
+      # Writes to the container's `environment` block (plaintext in task def).
+      # Use for non-sensitive config or values you'd rather manage in GitHub.
+      - name: Inject env vars from GitHub secrets
+        env:
+          # Sensitive DB connection values (GitHub Environment secrets)
+          DB_HOST:     ${{ secrets.DB_HOST }}
+          DB_PORT:     ${{ secrets.DB_PORT }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_NAME:     ${{ secrets.DB_NAME }}
+
+          # Per-environment URLs / origins (GitHub Environment variables)
+          PLAID_REDIRECT_URI:  ${{ vars.PLAID_REDIRECT_URI }}
+          PLAID_WEBHOOK_URL:   ${{ vars.PLAID_WEBHOOK_URL }}
+          CORS_ORIGIN:         ${{ vars.CORS_ORIGIN }}
+          GOOGLE_REDIRECT_URI: ${{ vars.GOOGLE_REDIRECT_URI }}
+          GMAIL_REDIRECT_URI:  ${{ vars.GMAIL_REDIRECT_URI }}
+          NODE_ENV:            ${{ vars.NODE_ENV }}
+          LOG_LEVEL:           ${{ vars.LOG_LEVEL }}
+          PLAID_ENV:           ${{ vars.PLAID_ENV }}
+        run: |
+          set -e
+
+          # Build name=value lines (one per line). Constants are hardcoded here;
+          # per-env values come from GitHub secrets/vars above.
+          ENV_ARRAY=$(printf '%s\n' \
+            "DB_HOST=$DB_HOST" \
+            "DB_PORT=$DB_PORT" \
+            "DB_USERNAME=$DB_USERNAME" \
+            "DB_NAME=$DB_NAME" \
+            "PORT=5000" \
+            "NODE_ENV=$NODE_ENV" \
+            "JWT_EXPIRES_IN=7d" \
+            "PLAID_ENABLED=true" \
+            "PLAID_ENV=$PLAID_ENV" \
+            "PLAID_REDIRECT_URI=$PLAID_REDIRECT_URI" \
+            "PLAID_WEBHOOK_URL=$PLAID_WEBHOOK_URL" \
+            "CORS_ORIGIN=$CORS_ORIGIN" \
+            "GOOGLE_REDIRECT_URI=$GOOGLE_REDIRECT_URI" \
+            "GMAIL_ENABLED=true" \
+            "GMAIL_REDIRECT_URI=$GMAIL_REDIRECT_URI" \
+            "GMAIL_REVOKE_HOURS=72" \
+            "AI_EMAIL_ENRICHMENT_ENABLED=true" \
+            "LOG_LEVEL=$LOG_LEVEL" \
+            "POLL_INTERVAL_SECONDS=25" \
+            "FIRST_CHECK_DELAY_SECONDS=25" \
+            "CHECK_INTERVAL_UNDER_1H_SECONDS=25" \
+            "CHECK_INTERVAL_UNDER_6H_SECONDS=25" \
+            "CHECK_INTERVAL_UNDER_24H_SECONDS=25" \
+            "CHECK_INTERVAL_OVER_24H_SECONDS=25" \
+            "MERCHANT_NO_RESPONSE_HOURS=0.00056" \
+          | jq -R -s '
+              split("\n")
+              | map(select(length > 0))
+              | map(capture("^(?<name>[^=]+)=(?<value>.*)$"))
+            ')
+
+          echo "Environment vars to inject:"
+          echo "$ENV_ARRAY" | jq '.'
+
+          jq --arg name "$CONTAINER_NAME" --argjson envs "$ENV_ARRAY" \
+            '.containerDefinitions |= map(if .name == $name then .environment = $envs else . end)' \
+            task-definition.json > task-definition.updated.json
+
+          mv task-definition.updated.json task-definition.json
+          echo "Task definition updated with env vars from GitHub secrets + vars."
+
+      # ----------------------------------------------------------------
+      # Inject secret refs from AWS Secrets Manager (app + DB secrets)
+      # ----------------------------------------------------------------
+      # Reads keys from BOTH secrets and merges them into the container's
+      # `secrets` block. ECS fetches values at task start via execution role.
+      # NOTE: key names must not collide across the two secrets or with the
+      # `environment` block injected above.
+      - name: Inject Secrets Manager refs
+        run: |
+          set -e
+
+          build_refs() {
+            local arn="$1"
+            local rename_map_json="${2:-{\}}"   # optional JSON object: { "oldKey": "NEW_NAME" }
+            if [ -z "$arn" ]; then
+              echo "[]"
+              return
+            fi
+            local json
+            json=$(aws secretsmanager get-secret-value \
+              --secret-id "$arn" \
+              --query SecretString --output text)
+            echo "$json" | jq -r --arg arn "$arn" --argjson rename "$rename_map_json" '
+              to_entries
+              | map({
+                  name: ( $rename[.key] // .key ),  # rename if present, else keep
+                  valueFrom: ($arn + ":" + .key + "::")
+                })
+            '
+          }
+
+          echo "Fetching APP secret: $SECRETS_MANAGER_ARN"
+          APP_REFS=$(build_refs "$SECRETS_MANAGER_ARN" '{}')
+
+          # RDS-managed secret uses lowercase keys (password, username, host, port, dbname).
+          # Map them to the env var names our app expects (DB_PASSWORD only here — others
+          # come from GitHub Environment secrets in the previous step).
+          echo "Fetching DB secret:  $DB_SECRETS_MANAGER_ARN"
+          DB_REFS=$(build_refs "$DB_SECRETS_MANAGER_ARN" '{"password":"DB_PASSWORD"}')
+
+          # Drop any DB keys we don't want exposed as env vars
+          DB_REFS=$(echo "$DB_REFS" | jq '[.[] | select(.name == "DB_PASSWORD")]')
+
+          SECRETS_ARRAY=$(jq -s 'add | unique_by(.name)' <(echo "$APP_REFS") <(echo "$DB_REFS"))
+
+          echo "Merged secrets to inject:"
+          echo "$SECRETS_ARRAY" | jq '.'
+
+          jq --arg name "$CONTAINER_NAME" --argjson secrets "$SECRETS_ARRAY" '
+            .containerDefinitions |= map(
+              if .name == $name then .secrets = $secrets else . end
+            )
+          ' task-definition.json > task-definition.updated.json
+
+          mv task-definition.updated.json task-definition.json
+          echo "Task definition updated with refreshed Secrets Manager references."
+      
+      - name: Verify env + secrets are present on target container
+        run: |
+          echo "=== Container names in task def ==="
+          jq -r '.containerDefinitions[].name' task-definition.json
+
+          echo ""
+          echo "=== Looking for container: $CONTAINER_NAME ==="
+          MATCH=$(jq --arg n "$CONTAINER_NAME" '[.containerDefinitions[] | select(.name == $n)] | length' task-definition.json)
+          if [ "$MATCH" -eq 0 ]; then
+            echo "ERROR: CONTAINER_NAME '$CONTAINER_NAME' does not match any container in task definition."
+            echo "Fix: set vars.CONTAINER_NAME to one of the names listed above."
+            exit 1
+          fi
+
+          echo ""
+          echo "=== environment[] on $CONTAINER_NAME ==="
+          jq --arg n "$CONTAINER_NAME" '.containerDefinitions[] | select(.name == $n) | .environment // []' task-definition.json
+
+          echo ""
+          echo "=== secrets[] on $CONTAINER_NAME ==="
+          jq --arg n "$CONTAINER_NAME" '.containerDefinitions[] | select(.name == $n) | .secrets // []' task-definition.json
+
+          ENV_COUNT=$(jq --arg n "$CONTAINER_NAME" '[.containerDefinitions[] | select(.name == $n) | .environment // [] | .[]] | length' task-definition.json)
+          SEC_COUNT=$(jq --arg n "$CONTAINER_NAME" '[.containerDefinitions[] | select(.name == $n) | .secrets // [] | .[]] | length' task-definition.json)
+          echo ""
+          echo "environment count: $ENV_COUNT"
+          echo "secrets count:     $SEC_COUNT"
+          if [ "$ENV_COUNT" -eq 0 ] && [ "$SEC_COUNT" -eq 0 ]; then
+            echo "ERROR: No env vars or secrets were injected. Check GitHub secrets and Secrets Manager."
+            exit 1
+          fi
 
       - name: Update task definition with new image
         id: task-def
@@ -256,22 +409,18 @@ jobs:
           container-name: ${{ env.CONTAINER_NAME }}
           image: ${{ env.IMAGE_URI }}
 
-      # --------------------------------------------
       # Deploy & force new deployment
-      # --------------------------------------------
       - name: Deploy updated task to ECS (force new deployment)
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
           task-definition: ${{ steps.task-def.outputs.task-definition }}
           service: ${{ env.ECS_SERVICE }}
           cluster: ${{ env.ECS_CLUSTER }}
-          force-new-deployment: true       # Spin up new task forcefully
-          wait-for-service-stability: true # Wait for deployment to stabilize
+          force-new-deployment: true       
+          wait-for-service-stability: true
           wait-for-minutes: 10
 
-      # --------------------------------------------
       # Health Check
-      # --------------------------------------------
       - name: Container health check
         run: |
           echo "=== Checking ECS Service Health ==="
@@ -331,9 +480,7 @@ jobs:
           
           echo "=== All containers are healthy! ==="
 
-      # --------------------------------------------
       # Deployment summary
-      # --------------------------------------------
       - name: Deployment summary
         run: |
           echo "=========================================="

@@ -1,0 +1,239 @@
+name: Unsubscribe-ai Frontend - Build and Deploy to S3
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - qa
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  
+  build:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    environment: frontend_s3_${{ github.event.inputs.environment }}
+
+    outputs:
+      environment: frontend_s_${{ github.event.inputs.environment }}
+      build_id:    ${{ steps.meta.outputs.build_id }}
+
+    env:
+      AWS_REGION:         ${{ vars.AWS_REGION }}
+      AWS_ROLE_ARN:       ${{ vars.AWS_ROLE_ARN }}
+      ENV_SECRET_ARN:     ${{ vars.ENV_SECRET_ARN }}
+      SOURCE_REPO:        ${{ vars.SOURCE_REPO }}
+      SOURCE_REPO_BRANCH: ${{ vars.SOURCE_REPO_BRANCH }}
+      BUILD_COMMAND:      ${{ vars.BUILD_COMMAND }}
+      NODE_VERSION:       ${{ vars.NODE_VERSION }}
+
+    steps:
+      - name: Display loaded environment configuration
+        run: |
+          echo "=== Loaded from GitHub Environment: frontend_${{ github.event.inputs.environment }} ==="
+          echo "SOURCE_REPO:        $SOURCE_REPO"
+          echo "SOURCE_REPO_BRANCH: $SOURCE_REPO_BRANCH"
+          echo "BUILD_COMMAND:      $BUILD_COMMAND"
+          echo "NODE_VERSION:       $NODE_VERSION"
+
+      - name: Checkout Frontend Repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REPO_BRANCH }}
+          token: ${{ secrets.ORG_PAT }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: |
+          if npm run | grep -qE '^\s+lint$'; then
+            npm run lint
+          else
+            echo "No 'lint' script defined in package.json — skipping."
+          fi
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch .env.${{ github.event.inputs.environment }} from Secrets Manager
+        env:
+          ENV_SUFFIX: ${{ github.event.inputs.environment }}
+        run: |
+          set -euo pipefail
+          test -n "$ENV_SECRET_ARN" || { echo "ENV_SECRET_ARN is empty"; exit 1; }
+
+          ENV_FILE=".env.${ENV_SUFFIX}"
+          aws secretsmanager get-secret-value \
+            --secret-id "$ENV_SECRET_ARN" \
+            --region "$AWS_REGION" \
+            --query 'SecretString' --output text \
+          | jq -r 'to_entries[] | "\(.key)=\(.value)"' > "$ENV_FILE"
+
+          echo "Generated $ENV_FILE with $(wc -l < "$ENV_FILE") keys:"
+          # Print keys only, never values
+          cut -d= -f1 "$ENV_FILE"
+
+      - name: Build project
+        run: ${{ env.BUILD_COMMAND }}
+
+      - name: Generate build metadata
+        id: meta
+        run: |
+          BUILD_ID="${{ github.event.inputs.environment }}-$(echo ${{ github.sha }} | cut -c1-7)-$(date +'%Y%m%d-%H%M%S')"
+          echo "build_id=$BUILD_ID" >> $GITHUB_OUTPUT
+          echo "Build ID: $BUILD_ID"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-dist-${{ steps.meta.outputs.build_id }}
+          path: dist
+          retention-days: 7
+
+  # ============================================
+  # DEPLOY JOB
+  # ============================================
+  deploy:
+    name: Deploy to S3 + CloudFront
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ needs.build.outputs.environment }}
+
+    env:
+      ROLE_ARN:                ${{ vars.AWS_ROLE_ARN }}
+      AWS_REGION:              ${{ vars.AWS_REGION }}
+      S3_BUCKET:               ${{ vars.S3_BUCKET }}               # e.g. unsubscribe-dev-frontend
+      CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}  # optional
+      SITE_URL:                ${{ vars.SITE_URL }}                # e.g. https://app-dev.getunsubscribe.com
+      BUILD_ID:                ${{ needs.build.outputs.build_id }}
+
+    steps:
+      - name: Display deploy configuration
+        run: |
+          echo "=== Deploying to: ${{ needs.build.outputs.environment }} ==="
+          echo "S3_BUCKET:                  $S3_BUCKET"
+          echo "CLOUDFRONT_DISTRIBUTION_ID: $CLOUDFRONT_DISTRIBUTION_ID"
+          echo "SITE_URL:                   $SITE_URL"
+          echo "BUILD_ID:                   $BUILD_ID"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: react-dist-${{ env.BUILD_ID }}
+          path: dist
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Sync hashed assets to S3 (long cache)
+        run: |
+          aws s3 sync dist/ s3://$S3_BUCKET/ \
+            --delete \
+            --exclude "index.html" \
+            --exclude "service-worker.js" \
+            --exclude "*.map" \
+            --cache-control "public, max-age=31536000, immutable"
+
+      - name: Sync index.html + service worker to S3 (no cache)
+        run: |
+          aws s3 sync dist/ s3://$S3_BUCKET/ \
+            --exclude "*" \
+            --include "index.html" \
+            --include "service-worker.js" \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      - name: Invalidate CloudFront cache
+        if: env.CLOUDFRONT_DISTRIBUTION_ID != ''
+        run: |
+          echo "Creating CloudFront invalidation..."
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "/*" \
+            --query 'Invalidation.Id' --output text)
+          echo "Invalidation ID: $INVALIDATION_ID"
+
+          echo "Waiting for invalidation to complete..."
+          aws cloudfront wait invalidation-completed \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --id "$INVALIDATION_ID"
+          echo "Invalidation complete."
+
+      
+      - name: Site health check
+        run: |
+          echo "=== Checking site availability: $SITE_URL ==="
+
+          MAX_ATTEMPTS=10
+          ATTEMPT=0
+          SUCCESS=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$SITE_URL" || echo "000")
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: HTTP $HTTP_CODE"
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              SUCCESS=1
+              break
+            fi
+            sleep 5
+          done
+
+          if [ $SUCCESS -ne 1 ]; then
+            echo "ERROR: Site did not return HTTP 200 after $MAX_ATTEMPTS attempts"
+            exit 1
+          fi
+
+          # Verify index.html contains a Vite-built asset reference (sanity check)
+          echo ""
+          echo "=== Verifying index.html contents ==="
+          if curl -s --max-time 10 "$SITE_URL" | grep -qE '<script.*assets/.*\.js'; then
+            echo "index.html references built assets — OK"
+          else
+            echo "WARNING: index.html did not reference expected built assets"
+          fi
+
+          echo "=== Site is healthy! ==="
+
+      # --------------------------------------------
+      # Deployment summary
+      # --------------------------------------------
+      - name: Deployment summary
+        run: |
+          echo "=========================================="
+          echo "      FRONTEND DEPLOYMENT SUCCESSFUL      "
+          echo "=========================================="
+          echo "Environment:    ${{ needs.build.outputs.environment }}"
+          echo "Build ID:       $BUILD_ID"
+          echo "S3 Bucket:      $S3_BUCKET"
+          echo "CloudFront:     ${CLOUDFRONT_DISTRIBUTION_ID:-<none>}"
+          echo "Site URL:       $SITE_URL"
+          echo "Commit:         ${{ github.sha }}"
+          echo "Triggered by:   ${{ github.actor }}"
+          echo "=========================================="

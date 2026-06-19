@@ -1,0 +1,91 @@
+==========================================================
+ LANDING PAGE CICD - Step-by-Step Explanation
+==========================================================
+
+==========================
+ JOB 1: BUILD (on GitHub runner)
+==========================
+
+Step 1: Checkout code
+---------------------
+Pulls the repository contents onto the GitHub runner so the
+workflow can read package.json, source code, etc.
+
+Step 2: Configure AWS credentials (OIDC)
+----------------------------------------
+Uses GitHub OIDC to assume the AWS_ROLE_ARN. No long-lived
+keys; temporary credentials are issued for this job only.
+
+Step 3: Fetch .env.<env> from Secrets Manager
+---------------------------------------------
+Reads the JSON secret at ENV_SECRET_ARN, converts each key/value
+into KEY=VALUE lines, and writes them to .env.dev or .env.qa at
+the repo root. This file is what Next.js will read at build time.
+
+Step 4: Generate build metadata
+-------------------------------
+Creates a unique BUILD_ID like dev-a1b2c3d-20260611-101530 and
+exposes it as a job output so the deploy job can reference it.
+
+Step 5: Stage source into artifact/
+-----------------------------------
+Copies the repo into an artifact/ folder, excluding things that
+shouldn't ship (.git, .github, node_modules, .next, logs). Verifies
+the .env.<env> file is included; fails the build if it's missing.
+
+Step 6: Upload source artifact
+------------------------------
+Uploads the artifact/ folder as landingpage-src-<env>. Hidden
+files are included so .env.<env> survives the upload. The deploy
+job (and EC2) will download this.
+
+==========================
+ JOB 2: DEPLOY (on GitHub runner, drives EC2 via SSM)
+==========================
+
+Step 1: Configure AWS credentials (OIDC)
+----------------------------------------
+Same as in build - assumes the OIDC role to get temp AWS creds.
+
+Step 2: Validate deploy inputs
+------------------------------
+Fails fast if EC2_INSTANCE_NAME, APP_PORT, HEALTH_PATH, or
+DEPLOY_GH_TOKEN aren't set. Saves time vs. failing later.
+
+Step 3: Resolve EC2 instance ID from Name tag
+---------------------------------------------
+Calls aws ec2 describe-instances filtered by tag:Name and
+state=running. Errors if zero or multiple matches. The resolved
+instance ID is exported to GITHUB_ENV so the next steps see it.
+
+Step 4: Deploy via SSM
+----------------------
+The runner builds a shell script and ships it to EC2 with
+aws ssm send-command (AWS-RunShellScript). On EC2 it:
+  - Wipes and recreates /home/ec2-user/release
+  - Downloads the artifact zip from GitHub (two-stage:
+      API call -> pre-signed S3 URL -> download)
+  - Unzips into release/
+  - Verifies .env.<env> exists in release/
+  - Runs `npm ci` and `npm run build:<env>`
+  - Verifies .next/ was generated
+  - rsyncs release/ into /home/ec2-user/landing-page/
+  - Ensures ecosystem.config.js is present
+  - Stops + deletes any existing pm2 processes
+  - Starts the app with pm2 and saves the process list
+  - Runs a health check loop on http://127.0.0.1:$APP_PORT$HEALTH_PATH
+The runner then polls SSM until the command finishes.
+
+Step 5: Print deploy logs
+-------------------------
+Runs even if the deploy step failed. Pulls STDOUT and STDERR
+from the SSM command invocation so you can see exactly what
+happened on the EC2 instance.
+
+Step 6: Deploy summary
+----------------------
+Prints a final banner with environment, build ID, instance ID,
+SSM command ID, and final status. Exits non-zero if the deploy
+didn't end in Success, so the workflow run is marked failed.
+
+==========================================================

@@ -1,0 +1,396 @@
+name: Landing Page CICD
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - qa
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+  issues: write
+
+jobs:
+  build:
+    name: Checkout source
+    runs-on: ubuntu-latest
+    environment: landing_${{ github.event.inputs.environment }}
+    outputs:
+      build_id: ${{ steps.meta.outputs.build_id }}
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      ENV_SECRET_ARN: ${{ vars.ENV_SECRET_ARN }}
+      ENVIRONMENT: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch .env.${{ github.event.inputs.environment }} from Secrets Manager
+        run: |
+          set -euo pipefail
+          test -n "$ENV_SECRET_ARN" || { echo "ENV_SECRET_ARN is empty"; exit 1; }
+
+          ENV_FILE=".env.${ENVIRONMENT}"
+          aws secretsmanager get-secret-value \
+            --secret-id "$ENV_SECRET_ARN" \
+            --region "$AWS_REGION" \
+            --query 'SecretString' --output text \
+          | jq -r 'to_entries[] | "\(.key)=\(.value)"' > "$ENV_FILE"
+
+          echo "Created $ENV_FILE with $(wc -l < "$ENV_FILE") keys"
+
+      - name: Setup Node.js (for lint)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.5'
+          cache: npm
+
+      - name: Install dependencies (for lint)
+        run: npm ci
+
+      - name: Lint
+        run: |
+          if npm run | grep -qE '^\s+lint$'; then
+            npm run lint
+          else
+            echo "No 'lint' script defined in package.json — skipping."
+          fi
+
+      - name: Generate build metadata
+        id: meta
+        run: |
+          BUILD_ID="${ENVIRONMENT}-$(echo "${{ github.sha }}" | cut -c1-7)-$(date +%Y%m%d-%H%M%S)"
+          echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+          echo "Build ID: $BUILD_ID"
+
+      - name: Stage source into artifact/
+        run: |
+          set -euo pipefail
+          rm -rf artifact
+          mkdir -p artifact
+
+          rsync -a ./ artifact/ \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='artifact' \
+            --exclude='node_modules' \
+            --exclude='.next' \
+            --exclude='*.log'
+
+          echo "Artifact tree (top level):"
+          ls -la artifact
+          echo ".env.${ENVIRONMENT} in artifact?"
+          ls -la "artifact/.env.${ENVIRONMENT}" || { echo "MISSING"; exit 1; }
+
+      - name: Upload source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: landingpage-src-${{ github.event.inputs.environment }}
+          path: artifact
+          include-hidden-files: true
+          retention-days: 7
+
+  deploy:
+    name: Deploy to EC2 via SSM
+    needs: build
+    runs-on: ubuntu-latest
+    environment: landing_${{ github.event.inputs.environment }}
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      EC2_INSTANCE_NAME: ${{ vars.EC2_INSTANCE_NAME }}
+      APP_PORT: ${{ vars.APP_PORT }}
+      HEALTH_PATH: ${{ vars.HEALTH_PATH }}
+      DEPLOY_GH_TOKEN: ${{ secrets.DEPLOY_GH_TOKEN }}
+
+    steps:
+      - name: Manual approval before deploy
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.token }}
+          approvers: ${{ vars.APPROVED_DEPLOY_USERS }}
+          minimum-approvals: 1
+          issue-title: Approve landing page deploy to ${{ github.event.inputs.environment }}
+          issue-body: |
+            Please approve or reject this deployment.
+
+            Environment: ${{ github.event.inputs.environment }}
+            Triggered by: ${{ github.actor }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate deploy inputs
+        run: |
+          test -n "$EC2_INSTANCE_NAME" || { echo "EC2_INSTANCE_NAME is empty"; exit 1; }
+          test -n "$APP_PORT"          || { echo "APP_PORT is empty";          exit 1; }
+          test -n "$HEALTH_PATH"       || { echo "HEALTH_PATH is empty";       exit 1; }
+          test -n "$DEPLOY_GH_TOKEN"   || { echo "DEPLOY_GH_TOKEN is empty";   exit 1; }
+
+      - name: Resolve EC2 instance ID from Name tag
+        id: ec2
+        run: |
+          set -euo pipefail
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --filters "Name=tag:Name,Values=${EC2_INSTANCE_NAME}" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+
+          # If multiple match, fail loudly
+          COUNT=$(echo "$INSTANCE_ID" | wc -w)
+          if [ "$COUNT" -eq 0 ] || [ -z "$INSTANCE_ID" ]; then
+            echo "ERROR: no running instance found with Name=$EC2_INSTANCE_NAME"
+            exit 1
+          fi
+          if [ "$COUNT" -gt 1 ]; then
+            echo "ERROR: multiple running instances found with Name=$EC2_INSTANCE_NAME: $INSTANCE_ID"
+            exit 1
+          fi
+
+          echo "Resolved $EC2_INSTANCE_NAME -> $INSTANCE_ID"
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "EC2_INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+
+      - name: Deploy via SSM
+        id: ssm
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOY_GH_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ART_NAME: landingpage-src-${{ github.event.inputs.environment }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          BUILD_ID: ${{ needs.build.outputs.build_id }}
+        run: |
+          set -euo pipefail
+
+          # ---- Remote deploy script (runs on EC2). Quoted heredoc -> no expansion here. ----
+          cat > deploy.sh <<'SCRIPT_EOF'
+          #!/bin/bash
+          set -euo pipefail
+
+          RELEASE_DIR=/home/ec2-user/release
+          TARGET_DIR=/home/ec2-user/landing-page
+          ZIP_PATH=/home/ec2-user/landing-page-src.zip
+          ART_API="https://api.github.com/repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100"
+
+          # 1) Wipe / create release folder
+          echo "Preparing release dir: $RELEASE_DIR"
+          rm -rf "$RELEASE_DIR"
+          mkdir -p "$RELEASE_DIR"
+
+          # 2) Download source artifact from GitHub into release dir
+          echo "Fetching artifact list from: $ART_API"
+          ART_RESPONSE=$(curl -fsSL \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "$ART_API")
+
+          ART_ID=$(echo "$ART_RESPONSE" | jq -r --arg N "$ART_NAME" \
+            '.artifacts[] | select(.name==$N) | .id' | head -n 1)
+
+          if [ -z "$ART_ID" ] || [ "$ART_ID" = "null" ]; then
+            echo "ERROR: Artifact not found: $ART_NAME"
+            echo "Available:"; echo "$ART_RESPONSE" | jq -r '.artifacts[].name'
+            exit 1
+          fi
+          echo "Artifact ID: $ART_ID"
+
+          DOWNLOAD_URL=$(curl -fsS -o /dev/null -w '%{redirect_url}' \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${REPO}/actions/artifacts/${ART_ID}/zip")
+
+          if [ -z "$DOWNLOAD_URL" ]; then
+            echo "ERROR: no pre-signed URL returned (token missing actions:read?)"
+            exit 1
+          fi
+
+          echo "Downloading source zip..."
+          curl -fL "$DOWNLOAD_URL" -o "$ZIP_PATH"
+          unzip -oq "$ZIP_PATH" -d "$RELEASE_DIR"
+          rm -f "$ZIP_PATH"
+
+          # 3) Build inside release dir
+          cd "$RELEASE_DIR"
+
+          if [ ! -f ".env.${ENVIRONMENT}" ]; then
+            echo "ERROR: .env.${ENVIRONMENT} missing from artifact"
+            ls -la
+            exit 1
+          fi
+          echo ".env.${ENVIRONMENT} present ($(wc -l < ".env.${ENVIRONMENT}") keys)"
+
+          echo "===== npm ci ====="
+          npm ci
+
+          echo "===== npm run build:${ENVIRONMENT} ====="
+          npm run "build:${ENVIRONMENT}"
+
+          if [ ! -d .next ]; then
+            echo "ERROR: .next not generated"
+            ls -la
+            exit 1
+          fi
+
+          # 4) Sync release -> landing-page
+          echo "Syncing release -> $TARGET_DIR"
+          mkdir -p "$TARGET_DIR"
+          rsync -a --delete \
+            --exclude='.git' \
+            --exclude='.github' \
+            "$RELEASE_DIR"/ "$TARGET_DIR"/
+
+          cd "$TARGET_DIR"
+
+          # 5) Make sure .env.${ENVIRONMENT} and ecosystem.config.js are present
+          if [ ! -f ".env.${ENVIRONMENT}" ]; then
+            echo "ERROR: .env.${ENVIRONMENT} missing in $TARGET_DIR"
+            exit 1
+          fi
+          if [ ! -f ecosystem.config.js ]; then
+            if [ -f /home/ec2-user/app/ecosystem.config.js ]; then
+              cp /home/ec2-user/app/ecosystem.config.js ./
+              echo "Copied ecosystem.config.js from /home/ec2-user/app/"
+            else
+              echo "ERROR: ecosystem.config.js not found"
+              exit 1
+            fi
+          fi
+
+          # 6) pm2: stop + delete existing, then start fresh
+          echo "===== pm2 list (before) ====="
+          pm2 list || true
+
+          if pm2 list | grep -qvE 'No process|^\s*$'; then
+            pm2 stop all   || true
+            pm2 delete all || true
+          fi
+
+          pm2 start ecosystem.config.js
+          pm2 save
+
+          echo "===== pm2 list (after) ====="
+          pm2 list
+
+          # 7) Health check
+          HEALTH_URL="http://127.0.0.1:${APP_PORT}${HEALTH_PATH}"
+          echo "Health check: $HEALTH_URL"
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$HEALTH_URL" || echo 000)
+            echo "Attempt $i: HTTP $code"
+            [ "$code" = "200" ] && break
+            if [ "$i" -eq 12 ]; then echo "Health check failed"; exit 1; fi
+            sleep 5
+          done
+          SCRIPT_EOF
+
+          # ---- Build SSM payload safely with jq ----
+          jq -n \
+            --arg gh        "$GH_TOKEN" \
+            --arg repo      "$REPO" \
+            --arg run_id    "$RUN_ID" \
+            --arg art       "$ART_NAME" \
+            --arg port      "$APP_PORT" \
+            --arg health    "$HEALTH_PATH" \
+            --arg env       "$ENVIRONMENT" \
+            --arg build     "$BUILD_ID" \
+            --arg script    "$(cat deploy.sh)" \
+            '{
+              commands: [
+                "export GH_TOKEN=\($gh)",
+                "export REPO=\($repo)",
+                "export RUN_ID=\($run_id)",
+                "export ART_NAME=\($art)",
+                "export APP_PORT=\($port)",
+                "export HEALTH_PATH=\($health)",
+                "export ENVIRONMENT=\($env)",
+                "export BUILD_ID=\($build)",
+                $script
+              ]
+            }' > ssm-params.json
+
+          # ---- Send command + poll ----
+          CMD_ID=$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --comment "Landing page CICD $BUILD_ID" \
+            --parameters file://ssm-params.json \
+            --query 'Command.CommandId' \
+            --output text)
+
+          if [ -z "$CMD_ID" ] || [ "$CMD_ID" = "None" ]; then
+            echo "ERROR: send-command did not return a CommandId."
+            exit 1
+          fi
+          echo "SSM Command ID: $CMD_ID"
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+
+          STATUS=InProgress
+          for _ in $(seq 1 240); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo "Pending")
+            echo "  status: $STATUS"
+            case "$STATUS" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 5
+          done
+          echo "ssm_status=$STATUS" >> "$GITHUB_OUTPUT"
+
+      - name: Print deploy logs
+        if: always() && steps.ssm.outputs.command_id != ''
+        run: |
+          CMD_ID="${{ steps.ssm.outputs.command_id }}"
+          echo "===== STDOUT ====="
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query 'StandardOutputContent' --output text
+          echo ""
+          echo "===== STDERR ====="
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query 'StandardErrorContent' --output text
+
+      - name: Deploy summary
+        if: always() && steps.ssm.outputs.command_id != ''
+        run: |
+          STATUS="${{ steps.ssm.outputs.ssm_status }}"
+          echo "=========================================="
+          [ "$STATUS" = "Success" ] && echo "        DEPLOY SUCCEEDED                  " || echo "        DEPLOY FAILED ($STATUS)           "
+          echo "=========================================="
+          echo "Environment:   ${{ github.event.inputs.environment }}"
+          echo "Build ID:      ${{ needs.build.outputs.build_id }}"
+          echo "Instance:      $EC2_INSTANCE_ID"
+          echo "SSM Command:   ${{ steps.ssm.outputs.command_id }}"
+          echo "Final status:  $STATUS"
+          echo "Triggered by:  ${{ github.actor }}"
+          echo "=========================================="
+          [ "$STATUS" = "Success" ]

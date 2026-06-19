@@ -1,0 +1,155 @@
+==========================================================
+ LANDING PAGE CICD - Workflow Steps
+ File: .github/workflows/landing-page-cicd.yml
+==========================================================
+
+TRIGGER
+-------
+- Manual: workflow_dispatch
+- Input:  environment = dev | qa  (default: dev)
+
+PERMISSIONS
+-----------
+- id-token: write   (needed for AWS OIDC)
+- contents: read
+- actions:  read    (so EC2 can pull the artifact via GitHub API)
+
+GITHUB SETTINGS REQUIRED
+------------------------
+Variables (under Environments -> landing_dev / landing_qa):
+  AWS_REGION          e.g. us-east-1
+  AWS_ROLE_ARN        OIDC role to assume
+  ENV_SECRET_ARN      Secrets Manager ARN holding .env JSON
+  EC2_INSTANCE_NAME   Value of the EC2 Name tag
+  APP_PORT            e.g. 3000
+  HEALTH_PATH         e.g. /api/health
+
+Secrets:
+  DEPLOY_GH_TOKEN     PAT with `actions:read` on this repo
+                      (used by EC2 to download the artifact)
+
+EC2 prerequisites:
+  - SSM Agent running, instance registered with SSM
+  - node, npm, pm2, jq, unzip, rsync installed
+  - Internet egress to api.github.com + S3
+  - OIDC role permissions:
+      * ec2:DescribeInstances
+      * ssm:SendCommand, ssm:GetCommandInvocation
+      * secretsmanager:GetSecretValue on ENV_SECRET_ARN
+
+==========================================================
+ JOB 1: build  (runs on ubuntu-latest)
+==========================================================
+1. Checkout code
+     - actions/checkout@v4
+
+2. Configure AWS credentials (OIDC)
+     - aws-actions/configure-aws-credentials@v4
+     - assumes AWS_ROLE_ARN in AWS_REGION
+
+3. Fetch .env.<env> from Secrets Manager
+     - aws secretsmanager get-secret-value -> jq -> .env.dev | .env.qa
+     - written at repo root
+
+4. Generate build metadata
+     - BUILD_ID = <env>-<sha7>-<timestamp>
+     - exposed as job output `build_id`
+
+5. Stage source into artifact/
+     - rsync ./ -> artifact/
+       excludes: .git, .github, artifact, node_modules, .next, *.log
+     - verifies .env.<env> is present inside artifact/
+
+6. Upload source artifact
+     - actions/upload-artifact@v4
+     - name: landingpage-src-<env>
+     - includes hidden files (.env.<env>)
+
+==========================================================
+ JOB 2: deploy  (needs build, runs on ubuntu-latest)
+==========================================================
+1. Configure AWS credentials (OIDC)
+
+2. Validate deploy inputs
+     - ensures EC2_INSTANCE_NAME, APP_PORT, HEALTH_PATH,
+       DEPLOY_GH_TOKEN are set
+
+3. Resolve EC2 instance ID from Name tag
+     - aws ec2 describe-instances filtered by:
+         tag:Name = EC2_INSTANCE_NAME
+         instance-state-name = running
+     - fails if zero or multiple matches
+     - exports EC2_INSTANCE_ID to GITHUB_ENV for later steps
+
+4. Deploy via SSM
+   a) Build a remote shell script (quoted heredoc -> no expansion on runner).
+   b) Build SSM payload with jq:
+        exports GH_TOKEN, REPO, RUN_ID, ART_NAME, APP_PORT,
+                HEALTH_PATH, ENVIRONMENT, BUILD_ID
+        then runs the script.
+   c) aws ssm send-command -> capture CommandId.
+   d) Poll get-command-invocation every 5s up to 240 times.
+   e) Outputs: command_id, ssm_status.
+
+   --- Remote script (runs on EC2 as root via SSM agent) ---
+   1) Wipe + recreate /home/ec2-user/release
+   2) Call GitHub API to find the artifact id by name,
+      then fetch the pre-signed S3 URL and download the zip.
+   3) Unzip into /home/ec2-user/release
+   4) cd release
+      - verify .env.<env> exists
+      - npm ci
+      - npm run build:<env>
+      - verify .next/ generated
+   5) rsync -a --delete release/ -> /home/ec2-user/landing-page/
+   6) Ensure .env.<env> and ecosystem.config.js exist in target
+      (falls back to /home/ec2-user/app/ecosystem.config.js if missing)
+   7) pm2 stop all + delete all (if anything is running)
+      pm2 start ecosystem.config.js
+      pm2 save
+   8) Health check loop:
+        curl http://127.0.0.1:${APP_PORT}${HEALTH_PATH}
+        12 attempts, 5s apart, must return 200
+
+5. Print deploy logs            (runs even on failure)
+     - dumps EC2 STDOUT and STDERR captured by SSM
+
+6. Deploy summary               (runs even on failure)
+     - prints banner: SUCCEEDED / FAILED
+     - shows env, build id, instance id, ssm command id
+     - exits 1 if ssm_status != Success
+
+==========================================================
+ ARTIFACT LAYOUT (uploaded by build job)
+==========================================================
+landingpage-src-<env>.zip
+  +-- package.json
+  +-- package-lock.json
+  +-- next.config.js
+  +-- ecosystem.config.js     (must exist in repo)
+  +-- .env.<env>              (written from Secrets Manager)
+  +-- src/, public/, etc.
+
+==========================================================
+ EC2 DIRECTORY LAYOUT (after deploy)
+==========================================================
+/home/ec2-user/release         <- fresh build workspace (rebuilt each run)
+/home/ec2-user/landing-page    <- live app (pm2 runs from here)
+/home/ec2-user/app/ecosystem.config.js   <- optional fallback config
+
+==========================================================
+ FAILURE MODES & WHERE TO LOOK
+==========================================================
+- "ENV_SECRET_ARN is empty"           -> set env var on environment
+- ".env.<env> missing from artifact"  -> Secrets Manager fetch failed,
+                                          or artifact upload skipped hidden files
+- "no running instance found ..."     -> Name tag wrong or instance stopped
+- "multiple running instances ..."    -> tighten Name tag uniqueness
+- "Artifact not found"                -> DEPLOY_GH_TOKEN missing actions:read
+- "no pre-signed URL returned"        -> same as above
+- ".next not generated"               -> check build:<env> script in package.json
+- pm2 start fails                     -> see "Print deploy logs" step output
+- health check fails                  -> app started but HEALTH_PATH wrong
+                                          or app crashed; check pm2 logs on EC2
+
+==========================================================

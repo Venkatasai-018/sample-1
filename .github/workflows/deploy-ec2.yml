@@ -1,0 +1,273 @@
+# Deploy to EC2 (Dev/QA single instance, Prod Auto Scaling Group)
+# Uses AWS SSM Run Command for zero-downtime in-place deployment
+
+name: Deploy Application to EC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - qa
+          - prod
+  push:
+    branches:
+      - develop   # auto-deploy to dev
+      - main      # auto-deploy to prod (with approval)
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  # ============================================
+  # DEPLOY JOB
+  # ============================================
+  deploy:
+    name: Deploy to ${{ github.event.inputs.environment || 'dev' }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    # Pull all env-specific values from GitHub Environment variables
+    env:
+      ROLE_ARN:        ${{ vars.AWS_ROLE_ARN }}
+      ENVIRONMENT:     ${{ vars.ENV_SUFFIX }}
+      PROJECT:         ${{ vars.PROJECT }}
+      
+      # For dev/qa (single EC2)
+      EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+      
+      # For prod (ASG)
+      ASG_NAME:        ${{ vars.ASG_NAME }}
+      
+      # Common
+      GIT_BRANCH:      ${{ vars.GIT_BRANCH }}
+      APP_PORT:        ${{ vars.APP_PORT }}
+      HEALTH_PATH:     ${{ vars.HEALTH_PATH }}    # e.g. /health
+      USE_ASG:         ${{ vars.USE_ASG }}        # "true" for prod, "false" otherwise
+    
+    steps:
+      # --------------------------------------------
+      # 1. Authenticate to AWS (OIDC)
+      # --------------------------------------------
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          role-session-name: GitHub-Deploy-${{ env.ENVIRONMENT }}-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify identity
+        run: aws sts get-caller-identity
+
+      # --------------------------------------------
+      # 2. Resolve target instances
+      # --------------------------------------------
+      - name: Resolve target instance IDs
+        id: targets
+        run: |
+          if [[ "$USE_ASG" == "true" ]]; then
+            echo "=== PROD: Fetching instances from ASG: $ASG_NAME ==="
+            INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "$ASG_NAME" \
+              --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+              --output text | tr '\t' ',')
+          else
+            echo "=== DEV/QA: Using single instance: $EC2_INSTANCE_ID ==="
+            INSTANCE_IDS="$EC2_INSTANCE_ID"
+          fi
+          
+          if [[ -z "$INSTANCE_IDS" ]]; then
+            echo "ERROR: No target instances resolved"
+            exit 1
+          fi
+          
+          echo "Target instances: $INSTANCE_IDS"
+          echo "instance_ids=$INSTANCE_IDS" >> $GITHUB_OUTPUT
+
+      # --------------------------------------------
+      # 3. Generate deployment metadata
+      # --------------------------------------------
+      - name: Generate deployment metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          DEPLOY_ID="${ENVIRONMENT}-${SHORT_SHA}-$(date +%Y%m%d-%H%M%S)"
+          echo "deploy_id=$DEPLOY_ID" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "Deployment ID: $DEPLOY_ID"
+
+      # --------------------------------------------
+      # 4. Trigger deploy via SSM Run Command
+      # --------------------------------------------
+      # For ASG: SSM targets all instances in parallel with rolling control
+      # For single EC2: SSM targets just that one instance
+      - name: Send deploy command via SSM
+        id: ssm
+        run: |
+          IFS=',' read -ra INSTANCES <<< "${{ steps.targets.outputs.instance_ids }}"
+          INSTANCE_JSON=$(printf '"%s",' "${INSTANCES[@]}" | sed 's/,$//')
+          INSTANCE_JSON="[${INSTANCE_JSON}]"
+          
+          echo "Sending command to: $INSTANCE_JSON"
+          
+          # Max-concurrency 1 for ASG = rolling deploy (one at a time)
+          # Max-errors 0 = stop on first failure
+          MAX_CONCURRENCY="1"
+          if [[ "$USE_ASG" != "true" ]]; then
+            MAX_CONCURRENCY="100%"
+          fi
+          
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids ${INSTANCES[@]} \
+            --max-concurrency "$MAX_CONCURRENCY" \
+            --max-errors "0" \
+            --timeout-seconds 900 \
+            --cloud-watch-output-config "CloudWatchOutputEnabled=true,CloudWatchLogGroupName=/ssm/deploy/${PROJECT}-${ENVIRONMENT}" \
+            --comment "Deploy ${{ steps.meta.outputs.deploy_id }} by ${{ github.actor }}" \
+            --parameters "{\"commands\":[\"sudo -u appuser bash /home/appuser/app/scripts/deploy.sh ${GIT_BRANCH} ${APP_PORT} ${HEALTH_PATH}\"]}" \
+            --query 'Command.CommandId' \
+            --output text)
+          
+          echo "SSM Command ID: $COMMAND_ID"
+          echo "command_id=$COMMAND_ID" >> $GITHUB_OUTPUT
+          echo "instances=${INSTANCES[*]}" >> $GITHUB_OUTPUT
+
+      # --------------------------------------------
+      # 5. Wait for SSM command completion
+      # --------------------------------------------
+      - name: Wait for deployment to complete
+        run: |
+          COMMAND_ID="${{ steps.ssm.outputs.command_id }}"
+          IFS=' ' read -ra INSTANCES <<< "${{ steps.ssm.outputs.instances }}"
+          
+          echo "Waiting for command $COMMAND_ID across ${#INSTANCES[@]} instance(s)..."
+          
+          # Poll every 15s, fail after 15 minutes
+          for i in {1..60}; do
+            sleep 15
+            ALL_DONE=true
+            ANY_FAILED=false
+            
+            for INSTANCE in "${INSTANCES[@]}"; do
+              STATUS=$(aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE" \
+                --query 'Status' --output text 2>/dev/null || echo "Pending")
+              
+              echo "[$i] Instance $INSTANCE: $STATUS"
+              
+              case "$STATUS" in
+                Success) ;;
+                Failed|Cancelled|TimedOut)
+                  ANY_FAILED=true
+                  ;;
+                *) ALL_DONE=false ;;
+              esac
+            done
+            
+            if $ANY_FAILED; then
+              echo "ERROR: Deployment failed on one or more instances"
+              for INSTANCE in "${INSTANCES[@]}"; do
+                echo "=== Logs for $INSTANCE ==="
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE" \
+                  --query '{Status:Status,StdErr:StandardErrorContent,StdOut:StandardOutputContent}' \
+                  --output text
+              done
+              exit 1
+            fi
+            
+            if $ALL_DONE; then
+              echo "All instances completed successfully!"
+              break
+            fi
+          done
+
+      # --------------------------------------------
+      # 6. Show deployment logs from each instance
+      # --------------------------------------------
+      - name: Fetch deployment output
+        if: always()
+        run: |
+          COMMAND_ID="${{ steps.ssm.outputs.command_id }}"
+          IFS=' ' read -ra INSTANCES <<< "${{ steps.ssm.outputs.instances }}"
+          
+          for INSTANCE in "${INSTANCES[@]}"; do
+            echo "=========================================="
+            echo "  Logs from $INSTANCE"
+            echo "=========================================="
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE" \
+              --query 'StandardOutputContent' \
+              --output text
+          done
+
+      # --------------------------------------------
+      # 7. Post-deploy health check
+      # --------------------------------------------
+      - name: Verify ASG health (prod only)
+        if: env.USE_ASG == 'true'
+        run: |
+          echo "Checking ASG health..."
+          aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query 'AutoScalingGroups[0].Instances[].[InstanceId,LifecycleState,HealthStatus]' \
+            --output table
+          
+          UNHEALTHY=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query 'AutoScalingGroups[0].Instances[?HealthStatus!=`Healthy`] | length(@)')
+          
+          if [[ "$UNHEALTHY" != "0" ]]; then
+            echo "ERROR: $UNHEALTHY unhealthy instance(s) in ASG"
+            exit 1
+          fi
+          echo "All ASG instances healthy"
+
+      - name: Verify endpoint (optional via ALB / domain)
+        if: vars.PUBLIC_URL != ''
+        run: |
+          URL="${{ vars.PUBLIC_URL }}${HEALTH_PATH}"
+          echo "Hitting health endpoint: $URL"
+          
+          for i in {1..10}; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
+            echo "Attempt $i: HTTP $HTTP_CODE"
+            if [[ "$HTTP_CODE" == "200" ]]; then
+              echo "Health check passed!"
+              exit 0
+            fi
+            sleep 10
+          done
+          
+          echo "ERROR: Health check failed after 10 attempts"
+          exit 1
+
+      # --------------------------------------------
+      # 8. Summary
+      # --------------------------------------------
+      - name: Deployment summary
+        run: |
+          echo "=========================================="
+          echo "       DEPLOYMENT SUCCESSFUL              "
+          echo "=========================================="
+          echo "Environment:  ${ENVIRONMENT}"
+          echo "Project:      ${PROJECT}"
+          echo "Branch:       ${GIT_BRANCH}"
+          echo "Deploy ID:    ${{ steps.meta.outputs.deploy_id }}"
+          echo "Commit:       ${{ github.sha }}"
+          echo "Mode:         $([ "$USE_ASG" == "true" ] && echo "ASG rolling" || echo "Single EC2")"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "=========================================="
