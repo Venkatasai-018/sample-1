@@ -1,1058 +1,162 @@
 {
-  "annotations": {
-    "list": [
-      {
-        "builtIn": 1,
-        "datasource": {
-          "type": "grafana",
-          "uid": "-- Grafana --"
-        },
-        "enable": true,
-        "hide": true,
-        "iconColor": "rgba(0, 211, 255, 1)",
-        "name": "Annotations & Alerts",
-        "type": "dashboard"
-      }
-    ]
-  },
-  "description": "CloudFront monitoring dashboard using AWS CloudWatch metrics. Select your CloudWatch datasource and CloudFront distribution ID from the dashboard variables.",
+  "annotations": { "list": [ { "builtIn": 1, "datasource": { "type": "grafana", "uid": "-- Grafana --" }, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard" } ] },
   "editable": true,
-  "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
   "id": null,
   "links": [],
-  "liveNow": false,
-  "panels": [
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 0
-      },
-      "id": 1,
-      "panels": [],
-      "title": "Overview",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "cloudwatch",
-        "uid": "$datasource"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 0,
-        "y": 1
-      },
-      "id": 2,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "sum"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto",
-        "wideLayout": true
-      },
-      "pluginVersion": "10.4.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "requests_total",
-          "label": "Requests",
-          "matchExact": true,
-          "metricName": "Requests",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "A",
-          "region": "us-east-1",
-          "statistic": "Sum"
-        }
-      ],
-      "title": "Total Requests",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "cloudwatch",
-        "uid": "$datasource"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 1
-              },
-              {
-                "color": "red",
-                "value": 5
-              }
-            ]
-          },
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 6,
-        "y": 1
-      },
-      "id": 3,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto",
-        "wideLayout": true
-      },
-      "pluginVersion": "10.4.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "total_error_rate",
-          "label": "Total error rate",
-          "matchExact": true,
-          "metricName": "TotalErrorRate",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "A",
-          "region": "us-east-1",
-          "statistic": "Average"
-        }
-      ],
-      "title": "Current Error Rate",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "cloudwatch",
-        "uid": "$datasource"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 75
-              },
-              {
-                "color": "red",
-                "value": 90
-              }
-            ]
-          },
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 12,
-        "y": 1
-      },
-      "id": 4,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto",
-        "wideLayout": true
-      },
-      "pluginVersion": "10.4.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "cache_hit_rate",
-          "label": "Cache hit rate",
-          "matchExact": true,
-          "metricName": "CacheHitRate",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "A",
-          "region": "us-east-1",
-          "statistic": "Average"
-        }
-      ],
-      "title": "Cache Hit Rate",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "cloudwatch",
-        "uid": "$datasource"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 500
-              },
-              {
-                "color": "red",
-                "value": 1000
-              }
-            ]
-          },
-          "unit": "ms"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 18,
-        "y": 1
-      },
-      "id": 5,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto",
-        "wideLayout": true
-      },
-      "pluginVersion": "10.4.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "origin_latency",
-          "label": "Origin latency",
-          "matchExact": true,
-          "metricName": "OriginLatency",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "A",
-          "region": "us-east-1",
-          "statistic": "Average"
-        }
-      ],
-      "title": "Origin Latency",
-      "type": "stat"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 5
-      },
-      "id": 6,
-      "panels": [],
-      "title": "Traffic",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "cloudwatch",
-        "uid": "$datasource"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 20,
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            }
-          },
-          "mappings": [],
-          "unit": "reqps"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 6
-      },
-      "id": 7,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "requests",
-          "label": "Requests",
-          "matchExact": true,
-          "metricName": "Requests",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "A",
-          "region": "us-east-1",
-          "statistic": "Sum"
-        }
-      ],
-      "title": "Requests",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "cloudwatch",
-        "uid": "$datasource"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 20,
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            }
-          },
-          "mappings": [],
-          "unit": "bytes"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 6
-      },
-      "id": 8,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "bytes_downloaded",
-          "label": "Bytes downloaded",
-          "matchExact": true,
-          "metricName": "BytesDownloaded",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "A",
-          "region": "us-east-1",
-          "statistic": "Sum"
-        },
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "bytes_uploaded",
-          "label": "Bytes uploaded",
-          "matchExact": true,
-          "metricName": "BytesUploaded",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "B",
-          "region": "us-east-1",
-          "statistic": "Sum"
-        }
-      ],
-      "title": "Data Transfer",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 14
-      },
-      "id": 9,
-      "panels": [],
-      "title": "Errors",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "cloudwatch",
-        "uid": "$datasource"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 20,
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 1
-              },
-              {
-                "color": "red",
-                "value": 5
-              }
-            ]
-          },
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 15
-      },
-      "id": 10,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "total_error_rate_ts",
-          "label": "Total error rate",
-          "matchExact": true,
-          "metricName": "TotalErrorRate",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "A",
-          "region": "us-east-1",
-          "statistic": "Average"
-        },
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "4xx_error_rate",
-          "label": "4xx error rate",
-          "matchExact": true,
-          "metricName": "4xxErrorRate",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "B",
-          "region": "us-east-1",
-          "statistic": "Average"
-        },
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "5xx_error_rate",
-          "label": "5xx error rate",
-          "matchExact": true,
-          "metricName": "5xxErrorRate",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "C",
-          "region": "us-east-1",
-          "statistic": "Average"
-        }
-      ],
-      "title": "Error Rates",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "cloudwatch",
-        "uid": "$datasource"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 15,
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            }
-          },
-          "mappings": [],
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 15
-      },
-      "id": 11,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "401_error_rate",
-          "label": "401 error rate",
-          "matchExact": true,
-          "metricName": "401ErrorRate",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "A",
-          "region": "us-east-1",
-          "statistic": "Average"
-        },
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "403_error_rate",
-          "label": "403 error rate",
-          "matchExact": true,
-          "metricName": "403ErrorRate",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "B",
-          "region": "us-east-1",
-          "statistic": "Average"
-        },
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "404_error_rate",
-          "label": "404 error rate",
-          "matchExact": true,
-          "metricName": "404ErrorRate",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "C",
-          "region": "us-east-1",
-          "statistic": "Average"
-        }
-      ],
-      "title": "Detailed 4xx Errors",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 23
-      },
-      "id": 12,
-      "panels": [],
-      "title": "Performance and Cache",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "cloudwatch",
-        "uid": "$datasource"
-      },
-      "description": "Requires CloudFront additional metrics to be enabled for the distribution.",
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 20,
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 75
-              },
-              {
-                "color": "green",
-                "value": 90
-              }
-            ]
-          },
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 24
-      },
-      "id": 13,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull",
-            "min"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "cache_hit_rate_ts",
-          "label": "Cache hit rate",
-          "matchExact": true,
-          "metricName": "CacheHitRate",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "A",
-          "region": "us-east-1",
-          "statistic": "Average"
-        }
-      ],
-      "title": "Cache Hit Rate",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "cloudwatch",
-        "uid": "$datasource"
-      },
-      "description": "Requires CloudFront additional metrics to be enabled for the distribution.",
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 20,
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 500
-              },
-              {
-                "color": "red",
-                "value": 1000
-              }
-            ]
-          },
-          "unit": "ms"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 24
-      },
-      "id": 14,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "cloudwatch",
-            "uid": "$datasource"
-          },
-          "dimensions": {
-            "DistributionId": "$distribution_id",
-            "Region": "Global"
-          },
-          "expression": "",
-          "id": "origin_latency_ts",
-          "label": "Origin latency",
-          "matchExact": true,
-          "metricName": "OriginLatency",
-          "namespace": "AWS/CloudFront",
-          "period": "300",
-          "queryMode": "Metrics",
-          "refId": "A",
-          "region": "us-east-1",
-          "statistic": "Average"
-        }
-      ],
-      "title": "Origin Latency",
-      "type": "timeseries"
-    }
-  ],
-  "refresh": "5m",
+  "refresh": "1m",
   "schemaVersion": 39,
-  "tags": [
-    "aws",
-    "cloudfront",
-    "cloudwatch"
-  ],
+  "tags": ["aws", "ecs", "alb", "containers", "fargate"],
   "templating": {
     "list": [
-      {
-        "current": {},
-        "hide": 0,
-        "includeAll": false,
-        "label": "CloudWatch datasource",
-        "multi": false,
-        "name": "datasource",
-        "options": [],
-        "query": "cloudwatch",
-        "refresh": 1,
-        "regex": "",
-        "type": "datasource"
-      },
-      {
-        "current": {},
-        "datasource": {
-          "type": "cloudwatch",
-          "uid": "$datasource"
-        },
-        "definition": "",
-        "hide": 0,
-        "includeAll": false,
-        "label": "CloudFront distribution",
-        "multi": false,
-        "name": "distribution_id",
-        "options": [],
-        "query": {
-          "dimensionKey": "DistributionId",
-          "metricName": "Requests",
-          "namespace": "AWS/CloudFront",
-          "queryType": "dimensionValues",
-          "region": "us-east-1"
-        },
-        "refresh": 2,
-        "regex": "",
-        "sort": 1,
-        "type": "query"
-      }
+      { "name": "datasource", "label": "CloudWatch data source", "type": "datasource", "query": "cloudwatch", "current": {}, "hide": 0, "refresh": 1, "regex": "", "skipUrlSync": false },
+      { "name": "region", "label": "Region", "type": "textbox", "query": "us-east-1", "current": { "text": "us-east-1", "value": "us-east-1" }, "hide": 0, "skipUrlSync": false },
+      { "name": "cluster", "label": "Cluster", "type": "query", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "definition": "dimension_values($region,AWS/ECS,CPUUtilization,ClusterName)", "query": { "queryType": "dimensionValues", "namespace": "AWS/ECS", "region": "$region", "metricName": "CPUUtilization", "dimensionKey": "ClusterName", "dimensionFilters": {} }, "refresh": 2, "includeAll": false, "multi": false, "hide": 0, "sort": 1, "current": {}, "skipUrlSync": false },
+      { "name": "service", "label": "Service", "type": "query", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "definition": "dimension_values($region,AWS/ECS,CPUUtilization,ServiceName)", "query": { "queryType": "dimensionValues", "namespace": "AWS/ECS", "region": "$region", "metricName": "CPUUtilization", "dimensionKey": "ServiceName", "dimensionFilters": { "ClusterName": ["$cluster"] } }, "refresh": 2, "includeAll": false, "multi": false, "hide": 0, "sort": 1, "current": {}, "skipUrlSync": false },
+      { "name": "loadbalancer", "label": "ALB (LoadBalancer)", "type": "query", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "definition": "dimension_values($region,AWS/ApplicationELB,RequestCount,LoadBalancer)", "query": { "queryType": "dimensionValues", "namespace": "AWS/ApplicationELB", "region": "$region", "metricName": "RequestCount", "dimensionKey": "LoadBalancer", "dimensionFilters": {} }, "refresh": 2, "includeAll": false, "multi": false, "hide": 0, "sort": 1, "current": {}, "skipUrlSync": false },
+      { "name": "targetgroup", "label": "Target Group", "type": "query", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "definition": "dimension_values($region,AWS/ApplicationELB,HealthyHostCount,TargetGroup)", "query": { "queryType": "dimensionValues", "namespace": "AWS/ApplicationELB", "region": "$region", "metricName": "HealthyHostCount", "dimensionKey": "TargetGroup", "dimensionFilters": {} }, "refresh": 2, "includeAll": false, "multi": false, "hide": 0, "sort": 1, "current": {}, "skipUrlSync": false }
     ]
   },
-  "time": {
-    "from": "now-24h",
-    "to": "now"
-  },
-  "timepicker": {
-    "refresh_intervals": [
-      "1m",
-      "5m",
-      "15m",
-      "30m",
-      "1h"
-    ]
-  },
-  "timezone": "browser",
-  "title": "AWS CloudFront - CloudWatch Overview",
-  "uid": "aws-cloudfront-cloudwatch-overview",
+  "time": { "from": "now-3h", "to": "now" },
+  "timezone": "",
+  "title": "ECS + ALB — Service, Task & Load Balancer Monitoring",
+  "uid": "ecs-alb-monitoring",
   "version": 1,
-  "weekStart": ""
+  "panels": [
+    { "type": "row", "title": "ECS Overview", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "collapsed": false, "panels": [] },
+
+    { "type": "stat", "title": "Running Tasks", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 5, "w": 5, "x": 0, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "fixed", "fixedColor": "green" }, "noValue": "needs Container Insights" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "ECS/ContainerInsights", "metricName": "RunningTaskCount", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 } ] },
+
+    { "type": "stat", "title": "Desired Tasks", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 5, "w": 5, "x": 5, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "fixed", "fixedColor": "blue" }, "noValue": "needs Container Insights" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "ECS/ContainerInsights", "metricName": "DesiredTaskCount", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 } ] },
+
+    { "type": "stat", "title": "Pending Tasks", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 5, "w": 4, "x": 10, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 } ] }, "noValue": "needs Container Insights" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "none", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "ECS/ContainerInsights", "metricName": "PendingTaskCount", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 } ] },
+
+    { "type": "stat", "title": "Service CPU %", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 5, "w": 5, "x": 14, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 70 }, { "color": "red", "value": 85 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "area", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ECS", "metricName": "CPUUtilization", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 } ] },
+
+    { "type": "stat", "title": "Service Memory %", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 5, "w": 5, "x": 19, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 75 }, { "color": "red", "value": 90 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "area", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ECS", "metricName": "MemoryUtilization", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 } ] },
+
+    { "type": "row", "title": "Task Health", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 }, "collapsed": false, "panels": [] },
+
+    { "type": "timeseries", "title": "Tasks: Running vs Desired vs Pending", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 24, "x": 0, "y": 7 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "lineInterpolation": "stepAfter" }, "color": { "mode": "palette-classic" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "ECS/ContainerInsights", "metricName": "RunningTaskCount", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "label": "Running", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 },
+        { "refId": "B", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "ECS/ContainerInsights", "metricName": "DesiredTaskCount", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "label": "Desired", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 },
+        { "refId": "C", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "ECS/ContainerInsights", "metricName": "PendingTaskCount", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "label": "Pending", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 }
+      ] },
+
+    { "type": "row", "title": "CPU & Memory", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 }, "collapsed": false, "panels": [] },
+
+    { "type": "timeseries", "title": "Service CPU Utilization %", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15, "showPoints": "never" }, "color": { "mode": "fixed", "fixedColor": "green" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ECS", "metricName": "CPUUtilization", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "label": "CPU %", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 } ] },
+
+    { "type": "timeseries", "title": "Service Memory Utilization %", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15, "showPoints": "never" }, "color": { "mode": "fixed", "fixedColor": "orange" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ECS", "metricName": "MemoryUtilization", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "label": "Memory %", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 } ] },
+
+    { "type": "timeseries", "title": "CPU Utilized vs Reserved", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }, "color": { "mode": "palette-classic" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "ECS/ContainerInsights", "metricName": "CpuUtilized", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "label": "Utilized", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 },
+        { "refId": "B", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "ECS/ContainerInsights", "metricName": "CpuReserved", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "label": "Reserved", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 }
+      ] },
+
+    { "type": "timeseries", "title": "Memory Utilized vs Reserved", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "decmbytes", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }, "color": { "mode": "palette-classic" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "ECS/ContainerInsights", "metricName": "MemoryUtilized", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "label": "Utilized", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 },
+        { "refId": "B", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "ECS/ContainerInsights", "metricName": "MemoryReserved", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "label": "Reserved", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 }
+      ] },
+
+    { "type": "row", "title": "ECS Network", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 }, "collapsed": false, "panels": [] },
+
+    { "type": "timeseries", "title": "Network Rx / Tx", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 24, "x": 0, "y": 33 },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }, "color": { "mode": "palette-classic" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "ECS/ContainerInsights", "metricName": "NetworkRxBytes", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "label": "Rx", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 },
+        { "refId": "B", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "ECS/ContainerInsights", "metricName": "NetworkTxBytes", "dimensions": { "ClusterName": "$cluster", "ServiceName": "$service" }, "statistic": "Average", "label": "Tx", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 }
+      ] },
+
+    { "type": "row", "title": "ALB — Health & Errors", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 41 }, "collapsed": false, "panels": [] },
+
+    { "type": "stat", "title": "Healthy Hosts", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 5, "w": 5, "x": 0, "y": 42 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "area", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ApplicationELB", "metricName": "HealthyHostCount", "dimensions": { "LoadBalancer": "$loadbalancer", "TargetGroup": "$targetgroup" }, "statistic": "Average", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 } ] },
+
+    { "type": "stat", "title": "Unhealthy Hosts", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 5, "w": 5, "x": 5, "y": 42 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "area", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ApplicationELB", "metricName": "UnHealthyHostCount", "dimensions": { "LoadBalancer": "$loadbalancer", "TargetGroup": "$targetgroup" }, "statistic": "Average", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 } ] },
+
+    { "type": "stat", "title": "ALB 5xx", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 5, "w": 4, "x": 10, "y": 42 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "area", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ApplicationELB", "metricName": "HTTPCode_ELB_5XX_Count", "dimensions": { "LoadBalancer": "$loadbalancer" }, "statistic": "Sum", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 } ] },
+
+    { "type": "stat", "title": "Target Response Time", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 5, "w": 5, "x": 14, "y": 42 },
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 3, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "red", "value": 1 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "area", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ApplicationELB", "metricName": "TargetResponseTime", "dimensions": { "LoadBalancer": "$loadbalancer", "TargetGroup": "$targetgroup" }, "statistic": "Average", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 } ] },
+
+    { "type": "stat", "title": "Request Count", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 5, "w": 5, "x": 19, "y": 42 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ApplicationELB", "metricName": "RequestCount", "dimensions": { "LoadBalancer": "$loadbalancer" }, "statistic": "Sum", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 } ] },
+
+    { "type": "row", "title": "ALB — Traffic & Latency", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 47 }, "collapsed": false, "panels": [] },
+
+    { "type": "timeseries", "title": "Request Count over time", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15, "showPoints": "never" }, "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ApplicationELB", "metricName": "RequestCount", "dimensions": { "LoadBalancer": "$loadbalancer" }, "statistic": "Sum", "label": "Requests", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 } ] },
+
+    { "type": "timeseries", "title": "HTTP Codes (target 2xx/4xx/5xx + ELB 5xx)", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }, "color": { "mode": "palette-classic" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ApplicationELB", "metricName": "HTTPCode_Target_2XX_Count", "dimensions": { "LoadBalancer": "$loadbalancer" }, "statistic": "Sum", "label": "2xx", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 },
+        { "refId": "B", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ApplicationELB", "metricName": "HTTPCode_Target_4XX_Count", "dimensions": { "LoadBalancer": "$loadbalancer" }, "statistic": "Sum", "label": "4xx", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 },
+        { "refId": "C", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ApplicationELB", "metricName": "HTTPCode_Target_5XX_Count", "dimensions": { "LoadBalancer": "$loadbalancer" }, "statistic": "Sum", "label": "5xx (target)", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 },
+        { "refId": "D", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ApplicationELB", "metricName": "HTTPCode_ELB_5XX_Count", "dimensions": { "LoadBalancer": "$loadbalancer" }, "statistic": "Sum", "label": "5xx (ELB)", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 }
+      ] },
+
+    { "type": "timeseries", "title": "Target Response Time (avg / p99)", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }, "color": { "mode": "palette-classic" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ApplicationELB", "metricName": "TargetResponseTime", "dimensions": { "LoadBalancer": "$loadbalancer", "TargetGroup": "$targetgroup" }, "statistic": "Average", "label": "avg", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 },
+        { "refId": "B", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ApplicationELB", "metricName": "TargetResponseTime", "dimensions": { "LoadBalancer": "$loadbalancer", "TargetGroup": "$targetgroup" }, "statistic": "p99", "label": "p99", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 }
+      ] },
+
+    { "type": "timeseries", "title": "Healthy vs Unhealthy Hosts", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15, "showPoints": "never", "lineInterpolation": "stepAfter" }, "color": { "mode": "palette-classic" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ApplicationELB", "metricName": "HealthyHostCount", "dimensions": { "LoadBalancer": "$loadbalancer", "TargetGroup": "$targetgroup" }, "statistic": "Average", "label": "Healthy", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 },
+        { "refId": "B", "datasource": { "type": "cloudwatch", "uid": "${datasource}" }, "queryMode": "Metrics", "region": "$region", "namespace": "AWS/ApplicationELB", "metricName": "UnHealthyHostCount", "dimensions": { "LoadBalancer": "$loadbalancer", "TargetGroup": "$targetgroup" }, "statistic": "Average", "label": "Unhealthy", "matchExact": true, "metricQueryType": 0, "metricEditorMode": 0 }
+      ] }
+  ]
 }
