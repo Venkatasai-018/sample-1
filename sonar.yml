@@ -1,0 +1,203 @@
+
+name: SonarQube Analysis Frontend
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  sonarqube:
+    name: Scan
+    runs-on: ubuntu-latest
+    environment: frontend_sonarqube
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    env:
+      SOURCE_REPO:        ${{ vars.SOURCE_REPO }}
+      SOURCE_REPO_BRANCH: ${{ vars.SOURCE_REPO_BRANCH }}
+      PROJECT_KEY:        unsubscribe-ai
+      PROJECT_NAME:       unsubscribe-ai
+      NOTIFY_EMAIL:       ${{ vars.NOTIFY_EMAIL }}
+      MAIL_FROM:          ${{ vars.MAIL_FROM }}
+      SMTP_SERVER:        ${{ secrets.SMTP_SERVER }}
+      SMTP_PORT:          ${{ secrets.SMTP_PORT }}
+      SMTP_USERNAME:      ${{ secrets.SMTP_USERNAME }}
+      SMTP_PASSWORD:      ${{ secrets.SMTP_PASSWORD }}
+    steps:
+      - name: Checkout Frontend Repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REPO_BRANCH }}
+          token: ${{ secrets.ORG_PAT }}
+          fetch-depth: 0          # full history for accurate new-code analysis
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm test -- --coverage --watchAll=false
+        continue-on-error: true
+
+      - name: Generate sonar-project.properties
+        run: |
+          cat > sonar-project.properties <<EOF
+          sonar.projectKey=${PROJECT_KEY}
+          sonar.projectName=${PROJECT_NAME}
+          sonar.sources=src
+          sonar.tests=src
+          sonar.test.inclusions=**/*.test.js,**/*.test.ts,**/*.spec.js,**/*.spec.ts
+          sonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/coverage/**,**/*.min.js
+          sonar.javascript.lcov.reportPaths=coverage/lcov.info
+          sonar.sourceEncoding=UTF-8
+          EOF
+          cat sonar-project.properties
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Quality Gate check
+        id: qualitygate
+        uses: SonarSource/sonarqube-quality-gate-action@master
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # ---- Build a report from the SonarQube API ------------------------------
+      - name: Build SonarQube report
+        id: report
+        env:
+          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          set -e
+          BASE="${SONAR_HOST_URL%/}"
+          METRICS="bugs,vulnerabilities,security_hotspots,code_smells,coverage,duplicated_lines_density,ncloc,reliability_rating,security_rating,sqale_rating"
+
+          STATUS=$(curl -s -u "$SONAR_TOKEN:" \
+            "$BASE/api/qualitygates/project_status?projectKey=$PROJECT_KEY" \
+            | jq -r '.projectStatus.status // "UNKNOWN"')
+
+          M=$(curl -s -u "$SONAR_TOKEN:" \
+            "$BASE/api/measures/component?component=$PROJECT_KEY&metricKeys=$METRICS")
+
+          get() { echo "$M" | jq -r --arg k "$1" '(.component.measures[]? | select(.metric==$k) | .value) // "-"'; }
+
+          DASH="$BASE/dashboard?id=$PROJECT_KEY"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "dashboard=$DASH" >> "$GITHUB_OUTPUT"
+
+          # JSON artifact
+          echo "$M" > sonar-report.json
+
+          # Markdown report
+          {
+            echo "# SonarQube Report — $PROJECT_NAME"
+            echo ""
+            echo "**Quality Gate:** \`$STATUS\`"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|---|---|"
+            echo "| Bugs | $(get bugs) |"
+            echo "| Vulnerabilities | $(get vulnerabilities) |"
+            echo "| Security Hotspots | $(get security_hotspots) |"
+            echo "| Code Smells | $(get code_smells) |"
+            echo "| Coverage | $(get coverage)% |"
+            echo "| Duplications | $(get duplicated_lines_density)% |"
+            echo "| Lines of Code | $(get ncloc) |"
+            echo ""
+            echo "[Open full dashboard]($DASH)"
+          } > sonar-report.md
+
+          # Show it IN THE PIPELINE (job summary tab)
+          cat sonar-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- Upload the report as a downloadable artifact -----------------------
+      - name: Upload SonarQube report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-report
+          path: |
+            sonar-report.md
+            sonar-report.json
+          retention-days: 30
+
+      # ---- Email the generated report ---------------------------------------
+      - name: Email SonarQube report
+        if: ${{ env.NOTIFY_EMAIL != '' && env.SMTP_SERVER != '' && env.SMTP_PORT != '' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ env.SMTP_SERVER }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
+          subject: SonarQube Report - ${{ env.PROJECT_NAME }} - ${{ steps.report.outputs.status }}
+          to: ${{ env.NOTIFY_EMAIL }}
+          from: ${{ env.MAIL_FROM }}
+          body: |
+            SonarQube report for ${{ env.PROJECT_NAME }}
+
+            Quality Gate: ${{ steps.report.outputs.status }}
+            Dashboard: ${{ steps.report.outputs.dashboard }}
+            Repository: ${{ env.SOURCE_REPO }}
+
+            The Markdown and JSON reports are attached.
+          attachments: sonar-report.md,sonar-report.json
+
+      # ---- Optional: Slack notification (only if webhook secret is set) -------
+      - name: Notify Slack
+        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          STATUS="${{ steps.report.outputs.status }}"
+          DASH="${{ steps.report.outputs.dashboard }}"
+          EMOJI=":white_check_mark:"; [ "$STATUS" != "OK" ] && EMOJI=":x:"
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"$EMOJI SonarQube *$PROJECT_NAME* — Quality Gate: *$STATUS*\n<$DASH|Open dashboard> | repo: $SOURCE_REPO\"}" \
+            "$SLACK_WEBHOOK_URL"
+
+      # ---- Post the report as a PR comment ---------------------------------------
+      - name: Comment report on PR
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('sonar-report.md', 'utf8');
+            const marker = '<!-- sonarqube-report -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.data.find(c => c.body && c.body.includes(marker));
+            const mentions = process.env.NOTIFY_GROUP ? `\n\ncc: ${process.env.NOTIFY_GROUP}` : '';
+            const finalBody = `${marker}\n${body}${mentions}`;
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body: finalBody });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: finalBody });
+            }
+
+      # ---- Finally, fail the job if the gate failed ---------------------------
+      - name: Enforce Quality Gate
+        if: ${{ steps.qualitygate.outcome == 'failure' }}
+        run: |
+          echo "Quality Gate failed — see the report above."
+          exit 1
