@@ -1,0 +1,1373 @@
+name: CD - Deploy am to EKS
+
+on:
+  workflow_run:
+    workflows: ["Docker - am"]
+    types: [completed]
+    branches:
+      - main
+      - testing
+# Allow manual triggering with environment and image tag selection
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - Prod
+          - Sandbox
+          - ProdInactive
+          - Stage-FT
+          - Stage-LT
+
+      image_tag:
+        description: "ECR image tag to deploy"
+        required: false
+        default: ""
+
+concurrency:
+  group: deploy-am
+  cancel-in-progress: false
+
+env:
+  CONFIG_FILE: environments/${{fromJSON('{"Prod":"prod","Sandbox":"Sandbox","ProdInactive":"pia","Stage-FT":"ft","Stage-LT":"lt"}')[github.event.inputs.environment || 'Sandbox'] || 'Sandbox'}}/am_vars.yaml
+  ARTIFACTS_FILE: environments/${{fromJSON('{"Prod":"prod","Sandbox":"Sandbox","ProdInactive":"pia","Stage-FT":"ft","Stage-LT":"lt"}')[github.event.inputs.environment || 'Sandbox'] || 'Sandbox'}}/artifacts_vars.yaml
+  CONFIG_ENV_SCOPE: environments.global_vars
+  GLOBAL_VARIABLES_FILE: globalvars/${{ fromJSON('{"Prod":"prod","Sandbox":"Sandbox","ProdInactive":"pia","Stage-FT":"ft","Stage-LT":"lt"}')[github.event.inputs.environment || 'Sandbox'] || 'Sandbox' }}/all_vars.yaml
+  CONFIG_SERVICE_SCOPE: services.am
+
+
+jobs:
+  deploy:
+    if: |
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       (github.event.workflow_run.head_branch == 'main' || github.event.workflow_run.head_branch == 'testing') &&
+       github.event.workflow_run.event != 'pull_request') ||
+      (github.event_name == 'workflow_dispatch' &&
+       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/testing'))
+    runs-on: [self-hosted, Linux, X64]
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+
+      # checkout GitHub
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for git log commands
+
+      # download deployment artifacts
+      - name: Download deployment artifacts
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: am-ci-environment
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: /tmp/am-ci
+
+      # load deployment configurations
+      - name: Load deployment configurations
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SELECTED_ENV="${{ github.event.inputs.environment }}"
+          elif [ -f "/tmp/am-ci/am-environment.txt" ]; then
+            SELECTED_ENV=$(tr -d '\r\n' < /tmp/am-ci/am-environment.txt)
+          else
+            SELECTED_ENV="Sandbox"
+          fi
+          case "${SELECTED_ENV}" in
+            Prod) ENV_DIR="prod" ;;
+            Sandbox) ENV_DIR="Sandbox" ;;
+            ProdInactive) ENV_DIR="pia" ;;
+            Stage-FT) ENV_DIR="ft" ;;
+            Stage-LT) ENV_DIR="lt" ;;
+            *)
+              echo "Invalid environment: ${SELECTED_ENV}"
+              exit 1
+              ;;
+          esac
+          CONFIG_FILE="environments/${ENV_DIR}/am_vars.yaml"
+          GLOBAL_VARS="globalvars/${ENV_DIR}/all_vars.yaml"
+          echo "CONFIG_FILE=${CONFIG_FILE}" >> $GITHUB_ENV
+          echo "GLOBAL_VARS=${GLOBAL_VARS}" >> $GITHUB_ENV
+          echo "ENV_DIR=${ENV_DIR}" >> $GITHUB_ENV
+          if ! command -v yq >/dev/null 2>&1; then
+            mkdir -p ~/.local/bin
+            curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 \
+              -o ~/.local/bin/yq
+            chmod +x ~/.local/bin/yq
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
+          echo "Loading all variables from am_vars.yaml and all_vars.yaml..."
+          
+          # Helper function to safely add multiline variables to GITHUB_ENV
+          add_var() {
+            local key="$1"
+            local value="$2"
+            if [[ "$value" == *$'\n'* ]]; then
+              # Use heredoc for multiline values
+              echo "${key}<<EOF" >> $GITHUB_ENV
+              echo "$value" >> $GITHUB_ENV
+              echo "EOF" >> $GITHUB_ENV
+            else
+              # Use simple format for single-line values
+              echo "${key}=${value}" >> $GITHUB_ENV
+            fi
+          }
+          
+          # Load all variables from global_vars section
+          echo "Loading global variables..."
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              key=$(echo "$line" | cut -d= -f1)
+              value=$(echo "$line" | cut -d= -f2-)
+              add_var "$key" "$value"
+            fi
+          done < <(yq eval '.environments.global_vars | to_entries | .[] | "\(.key)=\(.value)"' "${GLOBAL_VARS}")
+          
+          # Load all variables from cred_vars section (prefixed with AWS_)
+          echo "Loading credential variables..."
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              key=$(echo "$line" | cut -d= -f1)
+              value=$(echo "$line" | cut -d= -f2-)
+              add_var "AWS_${key}" "$value"
+            fi
+          done < <(yq eval '.environments.cred_vars | to_entries | .[] | "\(.key)=\(.value)"' "${GLOBAL_VARS}")
+          
+          # Load all variables from config_vars section
+          echo "Loading config variables..."
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              key=$(echo "$line" | cut -d= -f1)
+              value=$(echo "$line" | cut -d= -f2-)
+              add_var "$key" "$value"
+            fi
+          done < <(yq eval '.environments.config_vars | to_entries | .[] | "\(.key)=\(.value)"' "${GLOBAL_VARS}")
+          
+          # Load all variables from monitoring_vars section
+          echo "Loading monitoring variables..."
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              key=$(echo "$line" | cut -d= -f1)
+              value=$(echo "$line" | cut -d= -f2-)
+              add_var "$key" "$value"
+            fi
+          done < <(yq eval '.environments.monitoring_vars | to_entries | .[] | "\(.key)=\(.value)"' "${GLOBAL_VARS}")
+          
+          # Load all service-specific variables (am service)
+          echo "Loading am service variables..."
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              key=$(echo "$line" | cut -d= -f1)
+              value=$(echo "$line" | cut -d= -f2-)
+              add_var "$key" "$value"
+            fi
+          done < <(yq eval '.services.am | to_entries | .[] | "\(.key)=\(.value)"' "${CONFIG_FILE}")
+          
+          # Load artifact and tech versions if artifacts_vars.yaml exists
+          ARTIFACTS_FILE="environments/${ENV_DIR}/artifacts_vars.yaml"
+          if [ -f "${ARTIFACTS_FILE}" ]; then
+            echo "Loading artifact variables..."
+            while IFS= read -r line; do
+              if [ -n "$line" ]; then
+                key=$(echo "$line" | cut -d= -f1)
+                value=$(echo "$line" | cut -d= -f2-)
+                add_var "$key" "$value"
+              fi
+            done < <(yq eval '.tech | to_entries | .[] | "\(.key)=\(.value)"' "${ARTIFACTS_FILE}" 2>/dev/null || true)
+            
+            while IFS= read -r line; do
+              if [ -n "$line" ]; then
+                key=$(echo "$line" | cut -d= -f1)
+                value=$(echo "$line" | cut -d= -f2-)
+                add_var "$key" "$value"
+              fi
+            done < <(yq eval '.artifacts | to_entries | .[] | "\(.key)=\(.value)"' "${ARTIFACTS_FILE}" 2>/dev/null || true)
+          fi
+          
+          echo "All variables loaded successfully"
+      # configure aws credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_EKS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # prerequisites: kubernetes tooling
+      - name: Install AWS CLI and kubectl
+        shell: bash
+        run: |
+          set +e
+          
+          echo "=== Installing required tools ==="
+          # AWS CLI installation
+          if ! command -v aws >/dev/null 2>&1; then
+            echo "Installing AWS CLI..."
+            curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/aws.zip
+            unzip -qo /tmp/aws.zip -d /tmp
+            /tmp/aws/install --update 2>/dev/null || true
+            rm -rf /tmp/aws*
+          fi
+          # kubectl installation
+          if ! command -v kubectl >/dev/null 2>&1; then
+            echo "Installing kubectl..."
+            KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+            curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+              -o /usr/local/bin/kubectl
+            chmod +x /usr/local/bin/kubectl
+          fi
+          echo ""
+          echo "=== Tool versions ==="
+          aws --version 2>/dev/null || echo "aws: not available"  
+          kubectl version --client 2>/dev/null || echo "kubectl: not available"
+      # Debug: Show git history via local git log
+      - name: Debug - Show Commit History
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "## Git Commit History"
+            echo "### Commits touching kubernetes/ directory (Last 5)"
+            echo ""
+            echo "\`\`\`"
+            if git log --oneline --follow -- kubernetes/ 2>/dev/null | head -5; then
+              :
+            else
+              echo "No commits found"
+            fi
+            echo "\`\`\`"
+            echo ""
+            echo "### Commits touching globalvars/ directory (Last 5)"
+            echo ""
+            echo "\`\`\`"
+            if git log --oneline --follow -- globalvars/ 2>/dev/null | head -5; then
+              :
+            else
+              echo "No commits found"
+            fi
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      # resolve image tag
+      - name: Resolve image tag
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Reusable function to get latest image by push date with tag filter
+          get_latest_image() {
+            local region=$1
+            local repository=$2
+            local override_tag=$3
+            local service_name=$4
+            local tag_prefix=$5
+            
+            if [ -n "${override_tag}" ]; then
+              echo "${override_tag}"
+              return 0
+            fi
+            
+            # Filter for images with specific tag prefix, sort by push date, get most recent
+            local image_tag=$(aws ecr describe-images \
+              --region "${region}" \
+              --repository-name "${repository}" \
+              --output json | \
+              jq -r ".imageDetails | 
+                map(select(.imageTags != null and (.imageTags[] | startswith(\"${tag_prefix}\")))) | 
+                sort_by(.imagePushedAt) | 
+                reverse | 
+                .[0].imageTags[] | 
+                select(startswith(\"${tag_prefix}\"))" | head -n1)
+            
+            if [ -z "${image_tag}" ] || [ "${image_tag}" = "null" ]; then
+              echo "ERROR: No image found in ECR for ${service_name} with prefix ${tag_prefix}" >&2
+              return 1
+            fi
+            
+            echo "${image_tag}"
+          }
+          
+          # Resolve AM image tag (filter for am-sha- prefix)
+          AM_IMAGE_TAG=$(get_latest_image "${{ env.AWS_REGION }}" "${{ env.ECR_REPOSITORY }}" "${{ github.event.inputs.am_image_tag }}" "AM" "am-sha-")
+          echo "Resolved AM image tag: ${AM_IMAGE_TAG}"
+          AM_IMAGE_URI="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${AM_IMAGE_TAG}"
+          printf 'image_tag=%s\n' "${AM_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          printf 'image_uri=%s\n' "${AM_IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "AM → ${AM_IMAGE_URI}"
+      - name: Verify image exists in ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+                    # Reusable function to verify image
+          verify_image() {
+            local region=$1
+            local repository=$2
+            local image_tag=$3
+            local service_name=$4
+            
+            set +e
+            DESCRIBE_OUTPUT=$(aws ecr describe-images \
+              --region "${region}" \
+              --repository-name "${repository}" \
+              --image-ids imageTag="${image_tag}" 2>&1)
+            rc=$?
+            set -e
+            
+            if [ "$rc" -eq 0 ]; then
+              echo "Verified ${service_name} image exists in ECR: ${image_tag}"
+            elif echo "$DESCRIBE_OUTPUT" | grep -q "AccessDeniedException"; then
+              echo "Skipping ${service_name} existence check: role lacks ecr:DescribeImages permission"
+            else
+              echo "Failed to verify ${service_name} image: ${image_tag}"
+              echo "$DESCRIBE_OUTPUT"
+              return 1
+            fi
+          }
+          
+          # Verify both images
+          verify_image "${{ env.AWS_REGION }}" "${{ env.ECR_REPOSITORY }}" "${{ steps.vars.outputs.image_tag }}" "AM"
+      - name: Export image URIs to environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          # Export AM image URI to GITHUB_ENV for envsubst substitution
+          AM_IMAGE_URI="${{ steps.vars.outputs.image_uri }}"
+          echo "AM_IMAGE_URI=${AM_IMAGE_URI}" >> $GITHUB_ENV
+          echo "Exported AM_IMAGE_URI to environment: ${AM_IMAGE_URI}"
+          
+          # Also export IMAGE_URI for compatibility
+          IMAGE_URI="${{ steps.vars.outputs.image_uri }}"
+          echo "IMAGE_URI=${IMAGE_URI}" >> $GITHUB_ENV
+          
+      # Configure EKS access, update kubeconfig, bypass proxy, check connectivity
+      - name: Configure EKS access and verify connectivity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Step 1: Updating kubeconfig..."
+          if ! aws eks update-kubeconfig \
+            --region "${{ env.AWS_REGION }}" \
+            --name "${{ env.EKS_CLUSTER_NAME }}"; then
+            echo " ERROR: Failed to update kubeconfig"
+            echo "   Region: ${{ env.AWS_REGION }}"
+            echo "   Cluster: ${{ env.EKS_CLUSTER_NAME }}"
+            exit 1
+          fi
+          echo " Kubeconfig updated successfully"
+          echo ""
+          echo "Step 2: Extracting cluster endpoint and configuring NO_PROXY..."
+          CLUSTER_ENDPOINT=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+          if [ -z "${CLUSTER_ENDPOINT}" ]; then
+            echo " ERROR: Could not extract cluster endpoint from kubeconfig"
+            exit 1
+          fi
+          CLUSTER_HOST=${CLUSTER_ENDPOINT#https://}
+          CLUSTER_HOST=${CLUSTER_HOST%%/*}
+          if [ -z "${CLUSTER_HOST}" ]; then
+            echo " ERROR: Could not parse cluster hostname from endpoint: ${CLUSTER_ENDPOINT}"
+            exit 1
+          fi
+          echo " Cluster endpoint: ${CLUSTER_ENDPOINT}"
+          echo " Cluster host: ${CLUSTER_HOST}"
+          CURRENT_NO_PROXY="${NO_PROXY:-${no_proxy:-}}"
+          if [ -n "${CURRENT_NO_PROXY}" ]; then
+            UPDATED_NO_PROXY="${CURRENT_NO_PROXY},${CLUSTER_HOST}"
+          else
+            UPDATED_NO_PROXY="${CLUSTER_HOST}"
+          fi
+          printf 'EKS_API_HOST=%s\n' "${CLUSTER_HOST}" >> "$GITHUB_ENV"
+          printf 'NO_PROXY=%s\n' "${UPDATED_NO_PROXY}" >> "$GITHUB_ENV"
+          printf 'no_proxy=%s\n' "${UPDATED_NO_PROXY}" >> "$GITHUB_ENV"
+          echo "NO_PROXY configured: ${UPDATED_NO_PROXY}"
+          echo ""
+          echo "Step 3: Testing EKS API connectivity..."
+          if timeout 10 bash -c "</dev/tcp/${CLUSTER_HOST}/443"; then
+            echo " EKS API is reachable on port 443 (${CLUSTER_HOST}:443)"
+          else
+            echo " ERROR: Cannot reach EKS API at ${CLUSTER_HOST}:443 from this runner"
+            echo "   The cluster endpoint resolves privately and requires network access from the runner to the VPC/private endpoint."
+            echo "   Please verify:"
+            echo "   - Runner is in the same VPC/network as EKS cluster"
+            echo "   - Security groups allow outbound traffic on port 443"
+            echo "   - EKS endpoint is accessible (public or via private endpoint)"
+            exit 1
+          fi
+          echo ""
+          echo " All EKS configuration steps completed successfully"
+      # ============================================================================
+      # STEP 1: Capture pre-deployment state
+      # ============================================================================
+      - name: Capture AM Pre-Deployment State
+        id: pre_deploy
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          
+          echo "Capturing AM pre-deployment state..."
+          
+          # Get current pod
+          POD=$(kubectl -n "${{ env.K8S_NAMESPACE }}" get pods -l "app=eqhitepc,component=am" \
+            --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+          
+          if [ -z "${POD}" ]; then
+            echo "No running AM pod found. This may be the first deployment."
+            echo "first_deploy=true" >> "$GITHUB_OUTPUT"
+            
+            # Write to summary
+            {
+              echo "## AM Pre-Deployment State"
+              echo ""
+              echo "**Status:** First Deployment"
+              echo ""
+              echo "| Technology | Version |"
+              echo "|---|---|"
+              echo "| Current State | N/A (First Deploy) |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            
+            exit 0
+          fi
+          
+          # Capture current versions
+          JAVA_VERSION=$(kubectl -n "${{ env.K8S_NAMESPACE }}" exec "pod/${POD}" -c am -- \
+            java -version 2>&1 | grep -i 'Runtime Environment' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || echo "unknown")
+          TOMCAT_VERSION=$(kubectl -n "${{ env.K8S_NAMESPACE }}" exec "pod/${POD}" -c am -- \
+            sh -c "if [ -x /opt/tcathome/bin/catalina.sh ]; then /opt/tcathome/bin/catalina.sh version 2>/dev/null | grep 'Server version' | cut -d'/' -f2 | cut -d' ' -f1; fi" || echo "unknown")
+          OTEL_VERSION=$(kubectl -n "${{ env.K8S_NAMESPACE }}" exec "pod/${POD}" -c am -- \
+            sh -c "if [ -f /opt/tcathome/otel/lib/opentelemetry-javaagent.jar ]; then unzip -p /opt/tcathome/otel/lib/opentelemetry-javaagent.jar META-INF/MANIFEST.MF 2>/dev/null | sed -n 's/^Implementation-Version:[[:space:]]*//p' | tr -d '\n\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; fi" || echo "unknown")
+          
+          echo "JAVA_VERSION_BEFORE=${JAVA_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "TOMCAT_VERSION_BEFORE=${TOMCAT_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "OTEL_VERSION_BEFORE=${OTEL_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "first_deploy=false" >> "$GITHUB_OUTPUT"
+          echo "POD_BEFORE=${POD}" >> "$GITHUB_OUTPUT"
+          
+          # Write to summary
+          {
+            echo "## AM Pre-Deployment State"
+            echo ""
+            echo "**Current Pod:** \`${POD}\`"
+            echo "**Namespace:** \`${{ env.K8S_NAMESPACE }}\`"
+            echo "**Capture Timestamp:** \`$(date -u +'%Y-%m-%d %H:%M:%S UTC')\`"
+            echo ""
+            echo "### Current Technology Stack"
+            echo ""
+            echo "| Technology | Version |"
+            echo "|---|---|"
+            echo "| java | ${JAVA_VERSION} |"
+            echo "| tomcat | ${TOMCAT_VERSION} |"
+            echo "| otel-javaagent | ${OTEL_VERSION} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          
+          echo "Pre-deployment state captured"
+      
+      # ============================================================================
+      # STEP 2: Deployment Prep - Document changes and commit history
+      # ============================================================================
+      - name: Document Deployment Prep Changes
+        id: deployment_prep
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          
+          echo "Documenting deployment preparation details..."  
+          # Query each path separately (GitHub API doesn't support multiple path parameters)
+          DEPLOYMENTS=$(curl -fsSL \
+            -H "Authorization: token ${API_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/commits?path=kubernetes/deployments&per_page=5" 2>/dev/null | \
+            yq -r '.[] | "[" + .sha[0:7] + "](https://github.com/${{ github.repository }}/commit/" + .sha + ") - " + .commit.message' 2>/dev/null)
+          
+          SERVICES=$(curl -fsSL \
+            -H "Authorization: token ${API_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/commits?path=kubernetes/services&per_page=5" 2>/dev/null | \
+            yq -r '.[] | "[" + .sha[0:7] + "](https://github.com/${{ github.repository }}/commit/" + .sha + ") - " + .commit.message' 2>/dev/null)
+          
+          CONFIGMAPS=$(curl -fsSL \
+            -H "Authorization: token ${API_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/commits?path=kubernetes/configmaps&per_page=5" 2>/dev/null | \
+            yq -r '.[] | "[" + .sha[0:7] + "](https://github.com/${{ github.repository }}/commit/" + .sha + ") - " + .commit.message' 2>/dev/null)
+         
+          {\
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Deployment Preparation Summary"
+            echo ""
+            echo "**Deployment Start Time:** \`$(date -u +'%Y-%m-%d %H:%M:%S UTC')\`"
+            echo ""
+            echo "\`\`\`"
+            if [ -n "$REPO_CHANGES" ]; then
+              echo "$REPO_CHANGES"
+            else
+              echo "No recent deployment-related changes found"
+            fi
+            echo "\`\`\`"
+            echo ""
+            echo "### Technology Stack (Deployment Configuration)"
+            echo ""
+            echo "| Component | Version | URL |"
+            echo "|---|---|---|"
+            echo "| Java (Corretto) | ${{ env.CORRETTO_VERSION }} | ${{ env.CORRETTO_URL }} |"
+            echo "| Tomcat | ${{ env.TOMCAT_VERSION }} | ${{ env.TOMCAT_URL }} |"
+            echo ""
+            echo "### Artifact Information"
+            echo ""
+            echo "| Artifact | URL |"
+            echo "|---|---|"
+            echo "| AM Service WAR | ${{ env.AM_WAR_URL }} |"
+            echo "| Uman Client WAR | ${{ env.UMAN_WAR_URL }} |"
+            echo ""
+            echo "### Environment Configuration"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| **ECR Repository** | \`${{ env.ECR_REPOSITORY }}\` |"
+            
+            if [ "${{ steps.ecr_image.outputs.image_status }}" = "using_latest" ]; then
+              echo "| **Calculated Image Tag** | \`${{ steps.vars.outputs.image_tag }}\` |"
+              echo "| **Status** | Not found in ECR |"
+              echo "| **Using Latest Image Tag** | \`${{ steps.ecr_image.outputs.latest_image }}\` |"
+              echo "| **Final Image URI** | \`${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.ecr_image.outputs.latest_image }}\` |"
+            else
+              echo "| **Image Tag** | \`${{ steps.vars.outputs.image_tag }}\` |"
+              echo "| **Full Image URI** | \`${{ steps.vars.outputs.image_uri }}\` |"
+            fi
+            
+            echo "| **Kubernetes Namespace** | \`${{ env.K8S_NAMESPACE }}\` |"
+            echo "| **EKS Cluster** | \`${{ env.EKS_CLUSTER_NAME }}\` |"
+            echo "| **AWS Region** | \`${{ env.AWS_REGION }}\` |"
+            echo ""
+            echo "### Infrastructure & Connectivity"
+            echo ""
+            echo "| Component | Address |"
+            echo "|---|---|"
+            echo "| Proxy | ${{ env.PROXY_HOST }}:${{ env.PROXY_PORT }} |"
+            echo "| Database | ${{ env.DB_URL }} |"
+            echo "| Domain | ${{ env.DOMAIN_URL }} |"
+            echo "| OTEL Collector | ${{ env.OTEL_EXPORTER_OTLP_ENDPOINT }} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          
+          echo "Deployment prep documentation complete"
+      
+      # ============================================================================
+      # STEP 3: Detect manifest changes by comparing cluster state with repository
+      # ============================================================================
+      - name: Detect manifest changes
+        id: diff_deployment
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          
+          echo "=========================================="
+          echo "Comparing Cluster State with Repository"
+          echo "=========================================="
+          
+          case "${{ env.ENV_DIR }}" in
+            prod) CONFIGMAP_ENV_DIR="prod" ;;
+            Sandbox) CONFIGMAP_ENV_DIR="sbox" ;;
+            pia) CONFIGMAP_ENV_DIR="pia" ;;
+            ft) CONFIGMAP_ENV_DIR="ft" ;;
+            lt) CONFIGMAP_ENV_DIR="lt" ;;
+            *) CONFIGMAP_ENV_DIR="sbox" ;;
+          esac
+          
+          # Create temporary directory for storing current cluster state
+          CLUSTER_STATE_DIR="/tmp/cluster-state-$$"
+          mkdir -p "${CLUSTER_STATE_DIR}/configmaps"
+          mkdir -p "${CLUSTER_STATE_DIR}/diff-results"
+          
+          echo "CLUSTER_STATE_DIR=${CLUSTER_STATE_DIR}" >> "$GITHUB_OUTPUT"
+          echo "Cluster state will be stored in: ${CLUSTER_STATE_DIR}"
+          echo ""
+          
+          # ===== Three-Tier Deployment Change Detection =====
+          echo "Performing three-tier deployment change detection..."
+          DEPLOYMENT_TIER1_CHANGED=false
+          DEPLOYMENT_TIER2_CHANGED=false
+          DEPLOYMENT_TIER3_CHANGED=false
+          
+          # TIER 1: Check if deployment template file changed
+          echo "  TIER 1: Checking if deployment template changed..."
+          echo "    Running: git diff HEAD~1 HEAD --name-only"
+          CHANGED_FILES=$(git diff HEAD~1 HEAD --name-only 2>/dev/null || echo "ERROR: git diff failed")
+          echo "    Files changed: ${CHANGED_FILES}"
+          if echo "${CHANGED_FILES}" | grep -q "deployment-am-service.yaml"; then
+            echo "deployment-am-service.yaml modified in latest commit"
+            DEPLOYMENT_TIER1_CHANGED=true
+          else
+            echo "No deployment template changes"
+          fi
+          
+          # TIER 2: Check if variable files changed (for the selected environment only)
+          echo "  TIER 2: Checking if variables changed for ${{ env.ENV_DIR }} environment..."
+          if git diff HEAD~1 HEAD --name-only 2>/dev/null | grep -E "globalvars/${{ env.ENV_DIR }}/all_vars.yaml|environments/${{ env.ENV_DIR }}/am_vars.yaml|environments/${{ env.ENV_DIR }}/artifacts_vars.yaml" | grep -q .; then
+            echo "Variable files modified in latest commit for ${{ env.ENV_DIR }} environment"
+            DEPLOYMENT_TIER2_CHANGED=true
+          else
+            echo "No variable changes for ${{ env.ENV_DIR }} environment"
+          fi
+          echo ""
+          
+          # ===== Compare Deployment =====
+          echo "Checking Deployment changes..."
+          DEPLOYMENT_FILE="${{ env.DEPLOYMENT_FILE }}"
+          if [ -f "${DEPLOYMENT_FILE}" ]; then
+            kubectl get deployment "${{ env.DEPLOYMENT_NAME }}" \
+              -n "${{ env.K8S_NAMESPACE }}" \
+              -o yaml > "${CLUSTER_STATE_DIR}/deployment-current.yaml" 2>/dev/null || true
+            
+            if [ -f "${CLUSTER_STATE_DIR}/deployment-current.yaml" ]; then
+              # Compare deployment specs without validation errors
+              # First, substitute the repo deployment file (two-pass for nested variables)
+              envsubst < "${DEPLOYMENT_FILE}" | envsubst > "/tmp/deployment-substituted-$$.yaml" 2>/dev/null
+              
+              # Extract spec from cluster state
+              yq eval '.spec' "${CLUSTER_STATE_DIR}/deployment-current.yaml" 2>/dev/null | \
+                yq eval 'del(.progressDeadlineSeconds, .strategy, .template.metadata.annotations)' - 2>/dev/null | \
+                yq eval '(..|.env[]? | select(.value == null)) |= .value = ""' - 2>/dev/null | \
+                yq eval -o json '.' - 2>/dev/null | \
+                jq 'walk(if type == "object" then del(.successThreshold, .statusPort, .protocol, .scheme, .timeoutSeconds, .terminationMessagePath, .terminationMessagePolicy, .dnsPolicy, .apiVersion, .restartPolicy, .schedulerName, .securityContext, .serviceAccount, .terminationGracePeriodSeconds) else . end)' | \
+                jq 'walk(if type == "object" and .resources == {} then del(.resources) else . end)' | \
+                jq 'walk(if type == "object" and has("cpu") then .cpu |= (if type == "string" then (if . == "1000m" then "1" elif . == "100m" then "100m" elif . == "500m" then "500m" else . end) else . end) else . end)' | \
+                jq -S . > "/tmp/cluster-spec-$$.json" 2>/dev/null
+              
+              # Extract spec from substituted repo file
+              yq eval '.spec' "/tmp/deployment-substituted-$$.yaml" 2>/dev/null | \
+                yq eval 'del(.progressDeadlineSeconds, .strategy, .template.metadata.annotations)' - 2>/dev/null | \
+                yq eval '(..|.env[]? | select(.value == null)) |= .value = ""' - 2>/dev/null | \
+                yq eval -o json '.' - 2>/dev/null | \
+                jq 'walk(if type == "object" then del(.successThreshold, .statusPort, .protocol, .scheme, .timeoutSeconds, .terminationMessagePath, .terminationMessagePolicy, .dnsPolicy, .apiVersion, .restartPolicy, .schedulerName, .securityContext, .serviceAccount, .terminationGracePeriodSeconds) else . end)' | \
+                jq 'walk(if type == "object" and .resources == {} then del(.resources) else . end)' | \
+                jq 'walk(if type == "object" and has("cpu") then .cpu |= (if type == "string" then (if . == "1000m" then "1" elif . == "100m" then "100m" elif . == "500m" then "500m" else . end) else . end) else . end)' | \
+                jq -S . > "/tmp/repo-spec-$$.json" 2>/dev/null
+              
+              if diff -u "/tmp/cluster-spec-$$.json" "/tmp/repo-spec-$$.json" > "${CLUSTER_STATE_DIR}/diff-results/deployment.diff" 2>&1; then
+                # TIER 3: No spec differences
+                DEPLOYMENT_TIER3_CHANGED=false
+              else
+                # TIER 3: Spec differences exist
+                if [ $(grep '^[+-]' "${CLUSTER_STATE_DIR}/diff-results/deployment.diff" | wc -l) -gt 0 ]; then
+                  DEPLOYMENT_TIER3_CHANGED=true
+                fi
+              fi
+              
+              # Combine all three tiers
+              if [ "$DEPLOYMENT_TIER1_CHANGED" = true ] || [ "$DEPLOYMENT_TIER2_CHANGED" = true ] || [ "$DEPLOYMENT_TIER3_CHANGED" = true ]; then
+                echo "  Deployment: Changes detected"
+                [ "$DEPLOYMENT_TIER1_CHANGED" = true ] && echo "    • Template file changed"
+                [ "$DEPLOYMENT_TIER2_CHANGED" = true ] && echo "    • Variable files changed"
+                [ "$DEPLOYMENT_TIER3_CHANGED" = true ] && echo "    • Spec differs from cluster"
+                echo "changed=true" >> "$GITHUB_OUTPUT"
+                echo "Deployment diff preview:"
+                grep '^[+-]' "${CLUSTER_STATE_DIR}/diff-results/deployment.diff" | head -10 || true
+              else
+                echo "  Deployment: No changes detected"
+                echo "changed=false" >> "$GITHUB_OUTPUT"
+              fi
+              
+              rm -f "/tmp/deployment-substituted-$$.yaml" "/tmp/cluster-spec-$$.json" "/tmp/repo-spec-$$.json"
+            else
+              echo "  Deployment: Not found in cluster (first deployment)"
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+          echo ""
+          
+          # ===== Compare Service =====
+          echo "Checking Service changes..."
+          SERVICE_FILE="${{ env.SERVICE_FILE }}"
+          if [ -f "${SERVICE_FILE}" ]; then
+            kubectl get service "${{ env.DEPLOYMENT_NAME }}" \
+              -n "${{ env.K8S_NAMESPACE }}" \
+              -o yaml > "${CLUSTER_STATE_DIR}/service-current.yaml" 2>/dev/null || true
+            
+            if [ -f "${CLUSTER_STATE_DIR}/service-current.yaml" ]; then
+              if kubectl diff -f "${SERVICE_FILE}" -n "${{ env.K8S_NAMESPACE }}" > "${CLUSTER_STATE_DIR}/diff-results/service.diff" 2>&1; then
+                echo "  Service: No changes detected"
+                echo "service_changed=false" >> "$GITHUB_OUTPUT"
+              else
+                echo "  Service: Changes detected"
+                echo "service_changed=true" >> "$GITHUB_OUTPUT"
+                echo "Service diff preview:"
+                head -20 "${CLUSTER_STATE_DIR}/diff-results/service.diff" || true
+              fi
+            else
+              echo "  Service: Not found in cluster (first deployment)"
+              echo "service_changed=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+          echo ""
+          
+          # ===== Compare ConfigMaps =====
+          echo "Checking ConfigMap changes..."
+          CONFIGMAP_BASE_DIR="kubernetes/configmaps/${CONFIGMAP_ENV_DIR}/am/"
+          REPO_CONFIGMAPS=$(find "${CONFIGMAP_BASE_DIR}" -type f \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null | sort)
+          
+          CONFIGMAP_CHANGED=false
+          CONFIGMAP_CHANGE_COUNT=0
+          CONFIGMAP_DIFF_SUMMARY="${CLUSTER_STATE_DIR}/diff-results/configmap-summary.txt"
+          
+          echo "ConfigMap Comparison Results:" > "${CONFIGMAP_DIFF_SUMMARY}"
+          echo "=============================" >> "${CONFIGMAP_DIFF_SUMMARY}"
+          echo "" >> "${CONFIGMAP_DIFF_SUMMARY}"
+          
+          if [ -z "${REPO_CONFIGMAPS}" ]; then
+            echo "  No ConfigMap files found in repository"
+          else
+            CONFIGMAP_COUNT=$(echo "${REPO_CONFIGMAPS}" | wc -l)
+            echo "  Found ${CONFIGMAP_COUNT} ConfigMap file(s) to compare"
+            echo ""
+            
+            for REPO_FILE in ${REPO_CONFIGMAPS}; do
+              if [ ! -f "${REPO_FILE}" ]; then
+                continue
+              fi
+              
+              FILE_BASENAME=$(basename "${REPO_FILE}")
+              echo "  Checking: ${FILE_BASENAME}"
+              
+              # Get current ConfigMap from cluster using kubectl diff
+              CLUSTER_CONFIGMAP_FILE="${CLUSTER_STATE_DIR}/configmaps/${FILE_BASENAME}"
+              kubectl get -f "${REPO_FILE}" \
+                -n "${{ env.K8S_NAMESPACE }}" \
+                -o yaml > "${CLUSTER_CONFIGMAP_FILE}" 2>/dev/null || true
+              
+              if [ ! -f "${CLUSTER_CONFIGMAP_FILE}" ]; then
+                echo "    Status: NEW (not found in cluster)"
+                echo "[NEW] ${FILE_BASENAME}" >> "${CONFIGMAP_DIFF_SUMMARY}"
+                CONFIGMAP_CHANGED=true
+                ((CONFIGMAP_CHANGE_COUNT++))
+              else
+                # Compare the data section only (ignore metadata changes and YAML formatting)
+                DIFF_FILE="${CLUSTER_STATE_DIR}/diff-results/configmap-${FILE_BASENAME}.diff"
+                
+                # Extract and compare data sections, normalizing YAML formatting, escape sequences, and trailing whitespace
+                # Convert to JSON, normalize by removing trailing newlines and resolving escape sequences
+                yq eval -o json '.data' "${REPO_FILE}" 2>/dev/null | \
+                  jq -r 'with_entries(.value |= if type == "string" then gsub("\\n+$"; "") else . end) | to_entries | .[] | "\(.key)=\(.value)"' | sort > "/tmp/repo-data-$$.txt"
+                yq eval -o json '.data' "${CLUSTER_CONFIGMAP_FILE}" 2>/dev/null | \
+                  jq -r 'with_entries(.value |= if type == "string" then gsub("\\n+$"; "") else . end) | to_entries | .[] | "\(.key)=\(.value)"' | sort > "/tmp/cluster-data-$$.txt"
+                
+                if diff -u "/tmp/cluster-data-$$.txt" "/tmp/repo-data-$$.txt" > "${DIFF_FILE}" 2>&1; then
+                  echo "    Status: No changes"
+                else
+                  # Any difference in the data is reported as CHANGED
+                  echo "    Status: CHANGED"
+                  echo "[CHANGED] ${FILE_BASENAME}:" >> "${CONFIGMAP_DIFF_SUMMARY}"
+                  # Show only the data comparison without diff headers/timestamps
+                  grep '^[+-]' "${DIFF_FILE}" >> "${CONFIGMAP_DIFF_SUMMARY}" || true
+                  echo "" >> "${CONFIGMAP_DIFF_SUMMARY}"
+                  CONFIGMAP_CHANGED=true
+                  ((CONFIGMAP_CHANGE_COUNT++))
+                  
+                  # Show preview of changes (only data lines)
+                  echo "    Preview of changes:"
+                  grep '^[+-]' "${DIFF_FILE}" | head -5 | sed 's/^/      /' || true
+                fi
+                
+                rm -f "/tmp/repo-data-$$.txt" "/tmp/cluster-data-$$.txt"
+              fi
+              echo ""
+            done
+          fi
+          
+          echo "configmaps_changed=${CONFIGMAP_CHANGED}" >> "$GITHUB_OUTPUT"
+          echo "configmap_change_count=${CONFIGMAP_CHANGE_COUNT}" >> "$GITHUB_OUTPUT"
+          
+          echo ""
+          echo "=========================================="
+          echo "Change Detection Summary"
+          echo "=========================================="
+          echo "Deployment Changed: $(grep '^changed=' "$GITHUB_OUTPUT" | cut -d= -f2)"
+          echo "Service Changed: $(grep '^service_changed=' "$GITHUB_OUTPUT" | cut -d= -f2)"
+          echo "ConfigMaps Changed: ${CONFIGMAP_CHANGED} (${CONFIGMAP_CHANGE_COUNT} file(s))"
+          echo ""
+          
+          if [ -f "${CONFIGMAP_DIFF_SUMMARY}" ]; then
+            echo "ConfigMap changes summary:"
+            cat "${CONFIGMAP_DIFF_SUMMARY}"
+          fi
+          
+          echo "Change detection completed"
+      
+      # Document detected changes in GitHub Step Summary
+      - name: Document Detected Changes
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          
+          echo "Documenting detected changes..."
+          
+          CLUSTER_STATE_DIR="${{ steps.diff_deployment.outputs.CLUSTER_STATE_DIR }}"
+          
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Detected Changes Summary"
+            echo ""
+            echo "**Change Detection Time:** \`$(date -u +'%Y-%m-%d %H:%M:%S UTC')\`"
+            echo ""
+            echo "### Change Status"
+            echo ""
+            echo "| Component | Changed | Details |"
+            echo "|---|---|---|"
+            echo "| **Deployment** | ${{ steps.diff_deployment.outputs.changed }} | Deployment manifest changes |"
+            echo "| **Service** | ${{ steps.diff_deployment.outputs.service_changed }} | Service configuration changes |"
+            echo "| **ConfigMaps** | ${{ steps.diff_deployment.outputs.configmaps_changed }} | ${{ steps.diff_deployment.outputs.configmap_change_count }} file(s) changed |"
+            echo ""
+            
+            # Show ConfigMap changes details
+            if [ "${{ steps.diff_deployment.outputs.configmaps_changed }}" = "true" ]; then
+              echo "### ConfigMap Changes Details"
+              echo ""
+              
+              if [ -n "${CLUSTER_STATE_DIR}" ] && [ -f "${CLUSTER_STATE_DIR}/diff-results/configmap-summary.txt" ]; then
+                echo "\`\`\`diff"
+                cat "${CLUSTER_STATE_DIR}/diff-results/configmap-summary.txt"
+                echo "\`\`\`"
+              else
+                echo "ConfigMap changes detected but details not available."
+              fi
+              echo ""
+            fi
+            
+            # Show Service diff if changed
+            if [ "${{ steps.diff_deployment.outputs.service_changed }}" = "true" ]; then
+              echo "### Service Changes"
+              echo ""
+              if [ -n "${CLUSTER_STATE_DIR}" ] && [ -f "${CLUSTER_STATE_DIR}/diff-results/service.diff" ]; then
+                echo "<details>"
+                echo "<summary>Click to view service diff</summary>"
+                echo ""
+                echo "\`\`\`diff"
+                head -50 "${CLUSTER_STATE_DIR}/diff-results/service.diff"
+                echo "\`\`\`"
+                echo ""
+                echo "</details>"
+              fi
+              echo ""
+            fi
+            
+            # Show manifest status - compare HEAD~1 to HEAD (commit-to-commit diff)
+            echo "### Deployment Manifests Status"
+            echo ""
+            echo "| Type | File | Status | Related Commit |"
+            echo "|---|---|---|---|"
+            
+            # Determine environment directory mapping
+            case "${{ env.ENV_DIR }}" in
+              prod) CONFIGMAP_ENV_DIR="prod" ;;
+              Sandbox) CONFIGMAP_ENV_DIR="sbox" ;;
+              pia) CONFIGMAP_ENV_DIR="pia" ;;
+              ft) CONFIGMAP_ENV_DIR="ft" ;;
+              lt) CONFIGMAP_ENV_DIR="lt" ;;
+              *) CONFIGMAP_ENV_DIR="sbox" ;;
+            esac
+            
+            # Get list of all files changed in the current commit (HEAD vs HEAD~1)
+            CHANGED_FILES_IN_COMMIT=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+            
+            # Helper function to check file change status
+            check_file_status() {
+              local file="$1"
+              local changed_files="$2"
+              
+              if [ ! -f "$file" ]; then
+                echo "Not Found|N/A"
+                return
+              fi
+              
+              # Check if file was changed in current commit (HEAD~1 to HEAD)
+              if echo "$changed_files" | grep -qF "$file"; then
+                commit_sha=$(git log -1 --format=%h -- "$file" 2>/dev/null || echo "unknown")
+                echo "Changed|$commit_sha"
+                return
+              fi
+              
+              # Check if file exists in git but wasn't changed in this commit
+              if git ls-files --error-unmatch "$file" >/dev/null 2>&1; then
+                echo "Not changed|—"
+                return
+              fi
+              
+              # File exists but not tracked - new file
+              commit_sha=$(git log -1 --format=%h -- "$file" 2>/dev/null || echo "unknown")
+              echo "New File|$commit_sha"
+            }
+            
+            # Check static manifests
+            static_files=(
+              "kubernetes/deployments/deployment-am-service.yaml:Deployment"
+              "kubernetes/services/service-am.yaml:Service"
+            )
+            
+            for file_info in "${static_files[@]}"; do
+              IFS=':' read -r file type <<< "$file_info"
+              
+              result=$(check_file_status "$file" "$CHANGED_FILES_IN_COMMIT")
+              status=$(echo "$result" | cut -d'|' -f1)
+              commit_sha=$(echo "$result" | cut -d'|' -f2)
+              
+              # Format output with commit link if changed
+              if [ "$status" = "Changed" ] || [ "$status" = "New File" ]; then
+                if [ "$commit_sha" != "unknown" ] && [ "$commit_sha" != "N/A" ]; then
+                  echo "| $type | \`$file\` | $status | [\`$commit_sha\`](https://github.com/${{ github.repository }}/commit/$commit_sha) |"
+                else
+                  echo "| $type | \`$file\` | $status | $commit_sha |"
+                fi
+              else
+                echo "| $type | \`$file\` | $status | $commit_sha |"
+              fi
+            done
+            
+            # Dynamically discover and check ConfigMaps
+            CONFIGMAP_BASE_DIR="kubernetes/configmaps/${CONFIGMAP_ENV_DIR}/am/"
+            if [ -d "${CONFIGMAP_BASE_DIR}" ]; then
+              REPO_CONFIGMAPS=$(find "${CONFIGMAP_BASE_DIR}" -type f \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null | sort)
+              
+              if [ -n "${REPO_CONFIGMAPS}" ]; then
+                CONFIGMAP_COUNT=$(echo "${REPO_CONFIGMAPS}" | wc -l)
+                CONFIGMAP_NUM=0
+                
+                while IFS= read -r file; do
+                  ((CONFIGMAP_NUM++))
+                  
+                  result=$(check_file_status "$file" "$CHANGED_FILES_IN_COMMIT")
+                  status=$(echo "$result" | cut -d'|' -f1)
+                  commit_sha=$(echo "$result" | cut -d'|' -f2)
+                  
+                  # Format output with commit link if changed
+                  if [ "$status" = "Changed" ] || [ "$status" = "New File" ]; then
+                    if [ "$commit_sha" != "unknown" ] && [ "$commit_sha" != "N/A" ]; then
+                      echo "| ConfigMap ($CONFIGMAP_NUM/$CONFIGMAP_COUNT) | \`$file\` | $status | [\`$commit_sha\`](https://github.com/${{ github.repository }}/commit/$commit_sha) |"
+                    else
+                      echo "| ConfigMap ($CONFIGMAP_NUM/$CONFIGMAP_COUNT) | \`$file\` | $status | $commit_sha |"
+                    fi
+                  else
+                    echo "| ConfigMap ($CONFIGMAP_NUM/$CONFIGMAP_COUNT) | \`$file\` | $status | $commit_sha |"
+                  fi
+                done <<< "$REPO_CONFIGMAPS"
+              fi
+            fi
+            echo ""
+            
+            # Summary message based on actual cluster vs repo comparison (from diff_deployment step)
+            TOTAL_CHANGES=0
+            [ "${{ steps.diff_deployment.outputs.changed }}" = "true" ] && ((TOTAL_CHANGES++)) || true
+            [ "${{ steps.diff_deployment.outputs.service_changed }}" = "true" ] && ((TOTAL_CHANGES++)) || true
+            [ "${{ steps.diff_deployment.outputs.configmaps_changed }}" = "true" ] && ((TOTAL_CHANGES++)) || true
+            
+            if [ ${TOTAL_CHANGES} -eq 0 ]; then
+              echo "### Result"
+              echo ""
+              echo "No changes detected - Cluster state matches repository"
+              echo ""
+            else
+              echo "### Result"
+              echo ""
+              echo "${TOTAL_CHANGES} component(s) have changes - Deployment will proceed to update cluster"
+              echo ""
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          
+          echo "Change documentation completed"
+      
+      # ============================================================================
+      # STEP 4: Start Deployment - Sync Kubernetes manifests
+      # ============================================================================
+      # Sync all manifests: ConfigMaps, Deployment, and Service
+      - name: Sync all Kubernetes manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Determine environment directory mapping
+          case "${{ env.ENV_DIR }}" in
+            prod) CONFIGMAP_ENV_DIR="prod" ;;
+            Sandbox) CONFIGMAP_ENV_DIR="sbox" ;;
+            pia) CONFIGMAP_ENV_DIR="pia" ;;
+            ft) CONFIGMAP_ENV_DIR="ft" ;;
+            lt) CONFIGMAP_ENV_DIR="lt" ;;
+            *) CONFIGMAP_ENV_DIR="sbox" ;;
+          esac
+          
+          CONFIGMAP_BASE_DIR="kubernetes/configmaps/${CONFIGMAP_ENV_DIR}/am/"
+          
+          # Dynamically discover and apply ALL ConfigMap files
+          echo "Discovering ConfigMap files in ${CONFIGMAP_BASE_DIR}..."
+          CONFIGMAP_FILES=$(find "${CONFIGMAP_BASE_DIR}" -type f \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null | sort)
+          
+          if [ -z "${CONFIGMAP_FILES}" ]; then
+            echo "WARNING: No ConfigMap files found in ${CONFIGMAP_BASE_DIR}"
+          else
+            CONFIGMAP_COUNT=$(echo "${CONFIGMAP_FILES}" | wc -l)
+            echo "Found ${CONFIGMAP_COUNT} ConfigMap file(s) to apply"
+            echo ""
+            
+            APPLIED_COUNT=0
+            FAILED_COUNT=0
+            
+            for FILE in ${CONFIGMAP_FILES}; do
+              if [ ! -f "${FILE}" ]; then
+                echo "ERROR: ConfigMap file not found: ${FILE}"
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+                continue
+              fi
+              
+              echo "   [$(printf "%2d" $((APPLIED_COUNT + 1)))/${CONFIGMAP_COUNT}] Applying ConfigMap: ${FILE}"
+              if ! kubectl apply --validate=false \
+                -f "${FILE}" \
+                -n "${{ env.K8S_NAMESPACE }}"; then
+                echo "ERROR: Failed to apply ConfigMap from ${FILE}"
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+              else
+                APPLIED_COUNT=$((APPLIED_COUNT + 1))
+                echo "ConfigMap applied successfully"
+              fi
+            done
+            
+            echo ""
+            echo "ConfigMap Application Summary:"
+            echo "  Total Files: ${CONFIGMAP_COUNT}"
+            echo "  Successfully Applied: ${APPLIED_COUNT}"
+            echo "  Failed: ${FAILED_COUNT}"
+            
+            if [ ${FAILED_COUNT} -gt 0 ]; then
+              echo "ERROR: ${FAILED_COUNT} ConfigMap(s) failed to apply"
+              exit 1
+            fi
+          fi
+          echo "All ConfigMap manifests synced successfully"
+          echo ""
+          
+          # Process Deployment manifest with variable substitution
+          DEPLOYMENT_FILE="${{ env.DEPLOYMENT_FILE }}"
+          if [ -z "${DEPLOYMENT_FILE}" ] || [ "${DEPLOYMENT_FILE}" = "null" ]; then
+            echo "ERROR: Deployment file path is empty or null"
+            exit 1
+          fi
+          
+          if [ ! -f "${DEPLOYMENT_FILE}" ]; then
+            echo "ERROR: Deployment file not found: ${DEPLOYMENT_FILE}"
+            exit 1
+          fi
+          
+          echo "   Applying Deployment: ${DEPLOYMENT_FILE}"
+          # Substitute variables in deployment manifest (multiple passes for nested vars)
+          DEPLOYMENT_PROCESSED="/tmp/deployment-processed-$$.yaml"
+          cp "${DEPLOYMENT_FILE}" "${DEPLOYMENT_PROCESSED}"
+          
+          echo "   Current IMAGE_URI value: ${IMAGE_URI}"
+          
+          # First pass: substitute all variables
+          envsubst < "${DEPLOYMENT_PROCESSED}" > "${DEPLOYMENT_PROCESSED}.tmp"
+          mv "${DEPLOYMENT_PROCESSED}.tmp" "${DEPLOYMENT_PROCESSED}"
+          
+          # Verify substitution worked
+          SUBSTITUTED_IMAGE=$(grep -m1 'image:' "${DEPLOYMENT_PROCESSED}" | sed 's/.*image:[[:space:]]*"\?\([^"]*\)"\?.*/\1/' || echo "NOT_FOUND")
+          echo "   Image after substitution: ${SUBSTITUTED_IMAGE}"
+          
+          # Second pass: for nested variables like ${TCAT_HOME} in ${TCAT_HOME}/otel/lib/
+          envsubst < "${DEPLOYMENT_PROCESSED}" > "${DEPLOYMENT_PROCESSED}.tmp"
+          mv "${DEPLOYMENT_PROCESSED}.tmp" "${DEPLOYMENT_PROCESSED}"
+          
+          if ! kubectl apply --server-side --force-conflicts \
+            -f "${DEPLOYMENT_PROCESSED}" \
+            -n "${{ env.K8S_NAMESPACE }}"; then
+            echo "ERROR: Failed to apply Deployment from ${DEPLOYMENT_FILE}"
+            echo "Processed manifest for debugging:"
+            cat "${DEPLOYMENT_PROCESSED}" | head -100
+            rm -f "${DEPLOYMENT_PROCESSED}"
+            exit 1
+          fi
+          rm -f "${DEPLOYMENT_PROCESSED}"
+          echo "Deployment manifest synced successfully"
+          echo ""
+          
+          # Process Service manifest with variable substitution
+          SERVICE_FILE="${{ env.SERVICE_FILE }}"
+          if [ -z "${SERVICE_FILE}" ] || [ "${SERVICE_FILE}" = "null" ]; then
+            echo "ERROR: Service file path is empty or null"
+            exit 1
+          fi
+          
+          if [ ! -f "${SERVICE_FILE}" ]; then
+            echo "ERROR: Service file not found: ${SERVICE_FILE}"
+            exit 1
+          fi
+          
+          echo "   Applying Service: ${SERVICE_FILE}"
+          # Substitute variables in service manifest (multiple passes for nested vars)
+          SERVICE_PROCESSED="/tmp/service-processed-$$.yaml"
+          cp "${SERVICE_FILE}" "${SERVICE_PROCESSED}"
+          
+          # First pass: substitute all variables
+          envsubst < "${SERVICE_PROCESSED}" > "${SERVICE_PROCESSED}.tmp"
+          mv "${SERVICE_PROCESSED}.tmp" "${SERVICE_PROCESSED}"
+          
+          # Second pass: for nested variables
+          envsubst < "${SERVICE_PROCESSED}" > "${SERVICE_PROCESSED}.tmp"
+          mv "${SERVICE_PROCESSED}.tmp" "${SERVICE_PROCESSED}"
+          
+          if ! kubectl apply --server-side --force-conflicts \
+            -f "${SERVICE_PROCESSED}" \
+            -n "${{ env.K8S_NAMESPACE }}"; then
+            echo "ERROR: Failed to apply Service from ${SERVICE_FILE}"
+            echo "Processed manifest for debugging:"
+            cat "${SERVICE_PROCESSED}" | head -100
+            rm -f "${SERVICE_PROCESSED}"
+            exit 1
+          fi
+          rm -f "${SERVICE_PROCESSED}"
+          echo "Service manifest synced successfully"
+          echo ""
+          echo "All Kubernetes manifests synced successfully!"
+      
+      - name: Apply deployment changes
+        id: apply_changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEPLOYMENT_CHANGED="${{ steps.diff_deployment.outputs.changed }}"
+          SERVICE_CHANGED="${{ steps.diff_deployment.outputs.service_changed }}"
+          CONFIGMAP_CHANGED="${{ steps.diff_deployment.outputs.configmaps_changed }}"
+
+          # ===== PRIORITY 1: DEPLOYMENT CHANGES (HIGHEST) =====
+          if [ "$DEPLOYMENT_CHANGED" == "true" ]; then
+            echo "DEPLOYMENT CHANGES DETECTED"
+            echo ""
+            echo "Processing deployment changes..."
+            echo "  Action: kubectl rollout restart deployment (apply + rollout)"
+            kubectl -n "${{ env.K8S_NAMESPACE }}" rollout restart deployment/"${{ env.DEPLOYMENT_NAME }}"
+            echo "  Waiting for rollout to complete..."
+            kubectl -n "${{ env.K8S_NAMESPACE }}" rollout status deployment/"${{ env.DEPLOYMENT_NAME }}" --timeout=10m
+            echo "Deployment applied and rolled out successfully"
+            echo ""
+          fi  
+          
+          # ===== PRIORITY 2: CONFIGMAP CHANGES ONLY =====
+          if [ "$CONFIGMAP_CHANGED" == "true" ]; then
+            echo "CONFIGMAP CHANGES DETECTED"
+            echo ""
+            echo "Processing ConfigMap changes..."
+            echo "  Action: kubectl rollout restart (reload configs in pods)"
+            kubectl -n "${{ env.K8S_NAMESPACE }}" rollout restart deployment/"${{ env.DEPLOYMENT_NAME }}"
+            echo "  Waiting for rollout to complete..."
+            kubectl -n "${{ env.K8S_NAMESPACE }}" rollout status deployment/"${{ env.DEPLOYMENT_NAME }}" --timeout=10m
+            echo "ConfigMap changes applied, pods restarted"
+            echo ""
+          fi
+          
+          # ===== PRIORITY 3: SERVICE & HPA CHANGES =====
+          if [ "$SERVICE_CHANGED" == "true" ]; then
+            echo "SERVICE CHANGES DETECTED"
+            echo ""
+            echo "Processing Service changes..."
+            echo "  Action: kubectl apply (Service config updated)"
+            echo "  Note: Service already applied in 'Sync all Kubernetes manifests' step"
+            echo "Service changes applied"
+            echo ""
+          fi
+          
+          # ===== NO CHANGES =====
+          echo "No changes detected"
+          echo ""
+          echo "=========================================="
+          echo "Change Detection Summary"
+          echo "=========================================="
+          echo "Status: Cluster state matches repository"
+          echo "Action: No deployment/rollout needed"
+      - name: Set image on deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl -n "${{ env.K8S_NAMESPACE }}" set image deployment/"${{ env.DEPLOYMENT_NAME }}" \
+            "${{ env.CONTAINER_NAME }}"="${{ steps.vars.outputs.image_uri }}" \
+            "${{ env.INIT_CONTAINER_NAME }}"="${{ steps.vars.outputs.image_uri }}"
+      # deploy & verify: wait for rollout, show deployment, service and pods
+      - name: Deploy and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl rollout status \
+            deployment/"${{ env.DEPLOYMENT_NAME }}" \
+            -n "${{ env.K8S_NAMESPACE }}" \
+            --timeout=10m
+          echo "Deployment rollout completed successfully"
+      
+      # ============================================================================
+      # STEP 5: Deployment Validation & Application Healthcheck
+      # ============================================================================
+      # Capture post-deployment ConfigMap and Deployment snapshot
+      - name: Capture Post-Deployment ConfigMap & Deployment Snapshot
+        id: post_deploy_snapshot
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          
+          echo "Capturing post-deployment ConfigMap and Deployment snapshot..."
+          
+          # Capture new Deployment image and replicas
+          NEW_IMAGE=$(kubectl get deployment "${{ env.DEPLOYMENT_NAME }}" \
+            -n "${{ env.K8S_NAMESPACE }}" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "not-found")
+          
+          NEW_REPLICAS=$(kubectl get deployment "${{ env.DEPLOYMENT_NAME }}" \
+            -n "${{ env.K8S_NAMESPACE }}" \
+            -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+          
+          READY_REPLICAS=$(kubectl get deployment "${{ env.DEPLOYMENT_NAME }}" \
+            -n "${{ env.K8S_NAMESPACE }}" \
+            -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+          
+          # Get new pod(s) after deployment
+          PODS=$(kubectl -n "${{ env.K8S_NAMESPACE }}" get pods -l "app=eqhitepc,component=am" \
+            --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+          
+          if [ -z "${PODS}" ]; then
+            PODS="no-running-pods"
+          fi
+          
+          # Capture first new pod for version extraction
+          FIRST_POD=$(echo ${PODS} | awk '{print $1}')
+          
+          echo "NEW_IMAGE=${NEW_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "NEW_REPLICAS=${NEW_REPLICAS}" >> "$GITHUB_OUTPUT"
+          echo "READY_REPLICAS=${READY_REPLICAS}" >> "$GITHUB_OUTPUT"
+          echo "PODS_AFTER=${PODS}" >> "$GITHUB_OUTPUT"
+          echo "FIRST_POD_AFTER=${FIRST_POD}" >> "$GITHUB_OUTPUT"
+          
+          # Capture application versions from new pods
+          if [ "${FIRST_POD}" != "no-running-pods" ]; then
+            echo "Extracting application versions from pod: ${FIRST_POD}"
+            
+            JAVA_VERSION_AFTER=$(kubectl -n "${{ env.K8S_NAMESPACE }}" exec "pod/${FIRST_POD}" -c am -- \
+              java -version 2>&1 | grep -i 'Runtime Environment' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || echo "unknown")
+            
+            TOMCAT_VERSION_AFTER=$(kubectl -n "${{ env.K8S_NAMESPACE }}" exec "pod/${FIRST_POD}" -c am -- \
+              sh -c "if [ -x /opt/tcathome/bin/catalina.sh ]; then /opt/tcathome/bin/catalina.sh version 2>/dev/null | grep 'Server version' | cut -d'/' -f2 | cut -d' ' -f1; fi" || echo "unknown")
+            
+            OTEL_VERSION_AFTER=$(kubectl -n "${{ env.K8S_NAMESPACE }}" exec "pod/${FIRST_POD}" -c am -- \
+              sh -c "if [ -f /opt/tcathome/otel/lib/opentelemetry-javaagent.jar ]; then unzip -p /opt/tcathome/otel/lib/opentelemetry-javaagent.jar META-INF/MANIFEST.MF 2>/dev/null | sed -n 's/^Implementation-Version:[[:space:]]*//p' | tr -d '\n\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; fi" || echo "unknown")
+            
+            echo "JAVA_VERSION_AFTER=${JAVA_VERSION_AFTER}" >> "$GITHUB_OUTPUT"
+            echo "TOMCAT_VERSION_AFTER=${TOMCAT_VERSION_AFTER}" >> "$GITHUB_OUTPUT"
+            echo "OTEL_VERSION_AFTER=${OTEL_VERSION_AFTER}" >> "$GITHUB_OUTPUT"
+            
+            # ===== APPLICATION HEALTH CHECK =====
+            echo ""
+            echo "Performing application health check..."
+            HEALTH_CHECK_URL="http://localhost:8080/AmService/amService/AmServer/web/cfo/chs.fve"
+            HEALTH_STATUS="unknown"
+            HEALTH_RESPONSE_CODE="0"
+            HEALTH_CHECK_ERROR=""
+            
+            # Execute health check inside the pod
+            HEALTH_CHECK=$(kubectl -n "${{ env.K8S_NAMESPACE }}" exec "pod/${FIRST_POD}" -c am -- \
+              curl -s -w "\n%{http_code}" "${HEALTH_CHECK_URL}" 2>&1 || echo "error")
+            
+            # Parse response and status code
+            RESPONSE_BODY=$(echo "${HEALTH_CHECK}" | head -n -1)
+            HEALTH_RESPONSE_CODE=$(echo "${HEALTH_CHECK}" | tail -n 1)
+            
+            if [ "${HEALTH_RESPONSE_CODE}" = "200" ]; then
+              HEALTH_STATUS="healthy"
+              echo "Health check PASSED (HTTP 200)"
+            elif [ "${HEALTH_RESPONSE_CODE}" = "000" ] || [ "${HEALTH_RESPONSE_CODE}" = "error" ]; then
+              HEALTH_STATUS="unreachable"
+              HEALTH_CHECK_ERROR="Cannot reach AM service endpoint"
+              echo "Health check FAILED: Application not responding"
+            else
+              HEALTH_STATUS="unhealthy"
+              HEALTH_CHECK_ERROR="HTTP response code: ${HEALTH_RESPONSE_CODE}"
+              echo "Health check FAILED: ${HEALTH_CHECK_ERROR}"
+            fi
+            
+            echo "HEALTH_STATUS=${HEALTH_STATUS}" >> "$GITHUB_OUTPUT"
+            echo "HEALTH_RESPONSE_CODE=${HEALTH_RESPONSE_CODE}" >> "$GITHUB_OUTPUT"
+            echo "HEALTH_CHECK_ERROR=${HEALTH_CHECK_ERROR}" >> "$GITHUB_OUTPUT"
+          else
+            echo "JAVA_VERSION_AFTER=not-available" >> "$GITHUB_OUTPUT"
+            echo "TOMCAT_VERSION_AFTER=not-available" >> "$GITHUB_OUTPUT"
+            echo "OTEL_VERSION_AFTER=not-available" >> "$GITHUB_OUTPUT"
+            echo "HEALTH_STATUS=not-available" >> "$GITHUB_OUTPUT"
+            echo "HEALTH_RESPONSE_CODE=0" >> "$GITHUB_OUTPUT"
+            echo "HEALTH_CHECK_ERROR=No running pods" >> "$GITHUB_OUTPUT"
+          fi
+          
+          # Write deployment config and versions to summary
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Deployment Validation Results"
+            echo ""
+            echo "**Deployment End Time:** \`$(date -u +'%Y-%m-%d %H:%M:%S UTC')\`"
+            echo ""
+            echo "### Deployment Configuration"
+            echo ""
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| **Image** | \`${NEW_IMAGE}\` |"
+            echo "| **Desired Replicas** | \`${NEW_REPLICAS}\` |"
+            echo "| **Ready Replicas** | \`${READY_REPLICAS}/${NEW_REPLICAS}\` |"
+            echo ""
+            echo "### Running Pods (for TIG Investigation)"
+            echo ""
+            echo "\`\`\`"
+            echo "Running Pods: ${PODS}"
+            echo "\`\`\`"
+            echo ""
+            echo "### Post-Deployment Application Technology Stack"
+            echo ""
+            echo "| Technology | Version |"
+            echo "|---|---|"
+            if [ "${FIRST_POD}" != "no-running-pods" ]; then
+              echo "| java | ${JAVA_VERSION_AFTER} |"
+              echo "| tomcat | ${TOMCAT_VERSION_AFTER} |"
+              echo "| otel-javaagent | ${OTEL_VERSION_AFTER} |"
+            else
+              echo "| Status | Pods not yet running - retry healthcheck |"
+            fi
+            echo ""
+            echo "### Application Health Check Results"
+            echo ""
+            echo "| Metric | Status |"
+            echo "|---|---|"
+            if [ "${{ env.FIRST_POD }}" != "no-running-pods" ]; then
+              if [ -n "$HEALTH_RESPONSE_CODE" ]; then
+                echo "| **Health Status** | \`${HEALTH_STATUS}\` |"
+                echo "| **HTTP Response Code** | \`${HEALTH_RESPONSE_CODE}\` |"
+                if [ -n "$HEALTH_CHECK_ERROR" ]; then
+                  echo "| **Error Details** | ${HEALTH_CHECK_ERROR} |"
+                else
+                  echo "| **Endpoint** | \`http://localhost:8080/AmService/amService/AmServer/web/cfo/chs.fve\` |"
+                fi
+              else
+                echo "| **Status** | Health check not performed |"
+              fi
+            else
+              echo "| **Status** | Pods not running - skipped |"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Post-deployment snapshot captured"

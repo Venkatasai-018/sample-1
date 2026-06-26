@@ -5,7 +5,6 @@
 terraform {
   required_version = ">= 1.5.0"
 
-  # Uncomment to use S3 backend for state
   # backend "s3" {
   #   bucket         = "your-terraform-state-bucket"
   #   key            = "landing-page/dev/grafana/terraform.tfstate"
